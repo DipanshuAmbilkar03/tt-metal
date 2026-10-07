@@ -1448,7 +1448,6 @@
 #       regression is attributed on its own line. Asserts KV only, gated to layers 0..10 (the
 #       per-layer decoder readback cannot live inside a capture), and is the only section exercising
 #       ChunkMetadata.llama4_scale.
-# test weka path
 - name: "(Mistral-Small-4-119B) MLA, MLA chunked, block, MoE, transformer + chunked padded accuracy"
   cmd: |
     fail=0
@@ -1699,7 +1698,6 @@
 #   [2/3] 35 min: standalone harness, cache load + JIT + prefill + PCC readback (5 ring chunks), with
 #         headroom for cold kernel JIT and the ~180 GB tilized-cache read over NFS. A cold cache BUILD exceeds it.
 #   [3/3] 30 min: one runtime build + 6 short prefills, no golden readback; cache read + JIT dominate.
-# test weka path
 - name: "(GPT-OSS-120B) prefill runner accuracy longbook 55k@5k + chunked prefill KV accuracy longbook 5k@1k + variable-chunk smoke 1k vs 8k"
   fabric_profile: torus_xy
   cmd: |
@@ -1851,7 +1849,6 @@
 # an earlier one failed; the job fails if any of them failed.
 # Full 2K accuracy remains a required local check; restore its CI job before
 # project completion (see the model README).
-# test weka path
 - name: "(Llama-3.1-8B) prefill components, decoder + book top-5 accuracy 2k, 4k"
   fabric_profile: torus_xy
   cmd: |
@@ -1917,7 +1914,6 @@
 
 # One SC1 allocation checks the KV table and all layers of one active slot at PCC >= 0.99.
 # Use the first 32K tokens of the saved 128K reference; the model retains two cache slots.
-# test weka path
 - name: "(Llama-3.1-8B) prefill KV table and runner accuracy 32k, SC1"
   cmd: |
     set -euo pipefail
