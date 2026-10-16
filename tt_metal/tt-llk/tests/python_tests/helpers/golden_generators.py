@@ -4134,6 +4134,13 @@ RESHUFFLE_ROWS_FUSER_MASK = [
 class BinarySFPUGolden(EltwiseBinaryGolden):
     _TENSOR_OPS = frozenset(
         {
+            MathOperation.SfpuElwLt,
+            MathOperation.SfpuElwGt,
+            MathOperation.SfpuElwLe,
+            MathOperation.SfpuElwGe,
+            MathOperation.SfpuElwEq,
+            MathOperation.SfpuElwNe,
+            MathOperation.SfpuIsclose,
             MathOperation.SfpuElwadd,
             MathOperation.SfpuElwsub,
             MathOperation.SfpuElwmul,
@@ -4641,22 +4648,22 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
     # reach the result. The unary comparisons keep the total order -- different kernels, no
     # guard either.
     def _lt(self, t1, t2):
-        return float(t1 < t2)
+        return (t1 < t2).to(torch.float32)
 
     def _gt(self, t1, t2):
-        return float(t1 > t2)
+        return (t1 > t2).to(torch.float32)
 
     def _le(self, t1, t2):
-        return float(t1 <= t2)
+        return (t1 <= t2).to(torch.float32)
 
     def _ge(self, t1, t2):
-        return float(t1 >= t2)
+        return (t1 >= t2).to(torch.float32)
 
     def _eq(self, t1, t2):
-        return float(t1 == t2)
+        return (t1 == t2).to(torch.float32)
 
     def _ne(self, t1, t2):
-        return float(t1 != t2)
+        return (t1 != t2).to(torch.float32)
 
     @staticmethod
     def _is_float(t):
@@ -4822,7 +4829,7 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
             atol=self._ISCLOSE_ATOL,
             equal_nan=equal_nan,
         )
-        return 1.0 if bool(close) else 0.0
+        return close.to(torch.float32)
 
     def _isclose(self, t1, t2):
         return self._isclose_impl(t1, t2, equal_nan=False)
