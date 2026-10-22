@@ -71,8 +71,7 @@ DATASETS = {
         # same-build 256K runs differ by up to about 0.006 top-1, 0.03 ΔNLL and 0.02 KL; the limits leave room for it.
         likelihood_limits={0: (0.87, 0.36, 0.18), 8192: (0.86, 0.39, 0.24), 65536: (0.87, 0.39, 0.19)},
     ),
-    # InfiniteBench Code.Run id=391: 111161 tokens, so its last chunk is partly padded. Report-only until its
-    # limits are measured.
+    # InfiniteBench Code.Run id=391. Report-only until its limits are measured.
     "code_run": Dataset(trace_dir=GPU_TRACES / "hf-gemma4-31b-coding-example-transformed"),
 }
 
@@ -85,18 +84,20 @@ def selected_datasets():
 
 
 def load_token_ids(adapter, dataset, context_len):
-    """The dataset's token IDs, after checking it can be scored at ``context_len``; None if too short."""
+    """The dataset's token IDs and the length to score, its own when ``context_len`` is None; None if too short."""
     metadata = json.loads((dataset.trace_dir / "metadata.json").read_text())
     assert metadata["model_id"] == adapter.hf_model_id, f"{dataset.trace_dir} was captured from another model"
     assert metadata["layout"] == PREPARED_GPU_TRACE_LAYOUT, f"Prepare {dataset.trace_dir} with prepare_gpu_reference"
     assert metadata["n_layers"] == Gemma4ServiceConfig.NUM_LAYERS
-    if len(metadata["token_ids"]) < context_len:
+    token_ids = metadata["token_ids"]
+    context_len = context_len or len(token_ids)
+    if len(token_ids) < context_len:
         return None
     for layer in range(Gemma4ServiceConfig.NUM_LAYERS):
         assert (dataset.trace_dir / "kv_cache" / f"layer_{layer}.safetensors").is_file(), f"Missing layer {layer} KV"
     *_, stream = gpu_final_layer_stream(dataset.trace_dir)
     assert stream["row_count"] >= context_len, f"{dataset.trace_dir}: final-layer stream is shorter than its tokens"
-    return metadata["token_ids"]
+    return token_ids, context_len
 
 
 def run_params(adapter):
@@ -237,9 +238,8 @@ def check_dataset(runtime, kv_cache, name, dataset, token_ids, context_len, outp
 @parametrize_mesh_with_fabric(
     [Gemma4ServiceConfig.MESH_SHAPE], device_params_extra={"trace_region_size": TRACE_REGION_SIZE}
 )
-@pytest.mark.parametrize(
-    "context_len", [8192, 16384, 111161, 131072, 262144], ids=["8k", "16k", "111161", "128k", "256k"]
-)
+# "full" runs each dataset at its own length; a fixed length runs every dataset that holds that many tokens.
+@pytest.mark.parametrize("context_len", [8192, 16384, 131072, None], ids=["8k", "16k", "128k", "full"])
 def test_prefill_accuracy(mesh_device, context_len, tmp_path, request, monkeypatch):
     adapter = Gemma4PrefillAdapter()
     hf_config = adapter.load_hf_config()
@@ -253,9 +253,9 @@ def test_prefill_accuracy(mesh_device, context_len, tmp_path, request, monkeypat
     assert weight_cache_is_complete(cache, **identity), f"Missing or incompatible TT weight cache: {cache}"
     # Check every dataset before the model is built, so a bad one fails in seconds, not minutes.
     datasets = {
-        name: (dataset, token_ids)
+        name: (dataset, *loaded)
         for name, dataset in selected_datasets().items()
-        if (token_ids := load_token_ids(adapter, dataset, context_len)) is not None
+        if (loaded := load_token_ids(adapter, dataset, context_len)) is not None
     }
     if not datasets:
         pytest.skip(f"No selected dataset holds {context_len} tokens")
@@ -271,9 +271,9 @@ def test_prefill_accuracy(mesh_device, context_len, tmp_path, request, monkeypat
     runtime.capture_trace(kv_cache)
     failures = []
     try:
-        for name, (dataset, token_ids) in datasets.items():
+        for name, (dataset, token_ids, dataset_len) in datasets.items():
             monkeypatch.setenv("PREFILL_PCC_SUMMARY_DIR", str(output_root / name))
-            failures += check_dataset(runtime, kv_cache, name, dataset, token_ids, context_len, output_root / name)
+            failures += check_dataset(runtime, kv_cache, name, dataset, token_ids, dataset_len, output_root / name)
     finally:
         runtime.release_trace()
     if failures:
