@@ -21,9 +21,8 @@ tile (num_faces=4) and the 16x32 (num_faces=2) / 16x16 (num_faces=1) "tiny
 tiles" — mirroring the on-silicon MulReduceScalarTinyTile gtest suite.
 """
 
-import pytest
 import torch
-from helpers.chip_architecture import ChipArchitecture, get_chip_architecture
+from conftest import blackhole_only
 from helpers.data_format_inference import dest_acc_for
 from helpers.format_config import DataFormat, InputOutputFormat
 from helpers.llk_params import DestAccumulation, MathFidelity, format_dict
@@ -63,6 +62,8 @@ def _num_tiles_for_format(formats):
     )
 
 
+# mul_reduce_scalar is a Blackhole-only experimental LLK
+@blackhole_only
 @parametrize(
     formats=FORMATS,
     math_fidelity=[MathFidelity.HiFi2, MathFidelity.HiFi4],
@@ -70,9 +71,6 @@ def _num_tiles_for_format(formats):
     tile_dimensions=TILE_DIMENSIONS,
 )
 def test_mul_reduce_scalar(formats, math_fidelity, num_tiles, tile_dimensions):
-    if get_chip_architecture() != ChipArchitecture.BLACKHOLE:
-        pytest.skip("mul_reduce_scalar is a Blackhole-only experimental LLK")
-
     tile_shape = construct_tile_shape(tile_dimensions)
     elements_per_tile = tile_shape.total_tile_size()
     dest_acc = dest_acc_for(formats.output_format)
