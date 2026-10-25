@@ -6,7 +6,7 @@ from helpers.chip_architecture import ChipArchitecture, get_chip_architecture
 from helpers.device import BootMode
 from helpers.format_config import DataFormat, is_dest_acc_needed
 from helpers.golden_generators import MatmulGolden, get_golden_generator
-from helpers.llk_params import DestAccumulation, MathFidelity, format_dict
+from helpers.llk_params import DestAccumulation, MathFidelity
 from helpers.matmul_sweep import (
     generate_matmul_dimension_combinations,
     generate_tile_dims,
@@ -60,8 +60,6 @@ def _run_matmul_custom(
     throttle_level: int,
     boot_mode: BootMode,
 ):
-    torch_format = format_dict[formats.output_format]
-
     sfpu_false_spec = StimuliSpec.uniform(low=0.0, high=1.0)
     src_A, tile_cnt_A, src_B, tile_cnt_B = generate_stimuli(
         stimuli_format_A=formats.input_format,
