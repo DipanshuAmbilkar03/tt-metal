@@ -206,8 +206,8 @@ private:
     void worker_loop();
     // One WAIT_SIGNAL page on signal slot `slot_index` for `wait_value`.
     std::vector<uint8_t> wait_signal_page(uint32_t slot_index, uint32_t wait_value) const;
-    // Index in the signal slot table of op signal `signal_id`, which `api_name`'s caller passed in.
-    static uint32_t op_signal_slot(uint32_t signal_id, std::string_view api_name);
+    // TT_FATAL unless op signal `signal_id`, which `api_name`'s caller passed in, is in range.
+    static void validate_signal_id(uint32_t signal_id, std::string_view api_name);
     // DRISC L1 address of signal slot `slot_index`, uniform across every sender core of every device.
     uint32_t signal_slot_addr(uint32_t slot_index) const;
     // Add `word` to sender slot `sender`'s drain targets, dropping the ones whose memory is gone.
@@ -237,8 +237,8 @@ private:
         ttsl::optional_reference<const MeshCoordinateRangeSet> device_subset,
         const std::vector<experimental::TensorPrefetcherInput>& tensors,
         MeshCommandQueue* trace_capture_cq);
-    // TT_FATAL unless `trace_capture_cq`, which `api_name`'s caller passed in, is null or of this mesh device.
-    void validate_trace_capture_cq(const MeshCommandQueue* trace_capture_cq, std::string_view api_name) const;
+    // TT_FATAL unless `cq`, which `api_name`'s caller passed in, is null or of this mesh device.
+    void validate_own_cq(const MeshCommandQueue* cq, std::string_view api_name) const;
     // Capture `requests` into the trace `trace_capture_cq` is recording, if it is, else hand them to the
     // worker, in order and without interleaving with any other call's requests.
     void send_or_capture(std::vector<Request> requests, MeshCommandQueue* trace_capture_cq);

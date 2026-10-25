@@ -95,6 +95,12 @@ inline constexpr uint32_t kRequestPageBytes = 128;
 // The host zeroes the table before launching the kernels.
 constexpr uint32_t kNumCqSignalSlots = 2;
 
+// Index in the signal slot table of op signal `signal_id`.
+constexpr uint32_t op_signal_slot_index(uint32_t signal_id) { return kNumCqSignalSlots + signal_id; }
+
+// Whether signal slot `slot_index` is an op signal slot rather than a CQ fence slot.
+constexpr bool is_op_signal_slot(uint32_t slot_index) { return slot_index >= kNumCqSignalSlots; }
+
 // How a DRAIN request names a target: its target_state_addr, which is L1-aligned, with the low bit
 // set for a PrefetcherPipe and clear for a GlobalCircularBuffer.
 inline constexpr uint32_t kDrainTargetPipeBit = 1;
