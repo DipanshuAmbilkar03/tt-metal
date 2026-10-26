@@ -281,15 +281,18 @@ RouterVcShape router_vc_shape(
         // No VC1 or VC2 channels are ever created, independent of the num_vcs answer above.
         vc0_senders = builder_config::get_num_used_sender_channel_count(topology);
     } else {
-        // VC0: worker + wired producers, by family. The chip's Z-port role adds nothing on
-        // VC0: an intermesh boundary's VC0 receiver forwards nowhere, so no from-boundary
-        // producer exists on VC0 regardless of the chip's role -- the role addend lands on VC1.
+        // VC0: worker + wired producers, by family. Unless intermesh_on_vc0, the chip's Z-port role
+        // adds nothing on VC0: an intermesh boundary's VC0 receiver forwards nowhere, so no
+        // from-boundary producer exists on VC0 -- the role addend lands on VC1. With intermesh_on_vc0
+        // there is no VC1, and the from-boundary producer is on VC0 (the branch below).
         if (z_boundary_router) {
             vc0_senders = boundary_vc0_sender_count();
         } else if (intermesh_on_vc0 && chip_z_role == ZPortRole::INTERMESH_BOUNDARY && !is_x_axis_direction(facing)) {
             TT_FATAL(!express_routing_enabled, "intermesh_on_vc0 does not support express routing");
-            // The landing traffic's from-boundary slot moves from VC1 to VC0, on Y routers only: landed
-            // traffic routes Y first and (coordinate-matched) never needs an X hop on the landing chip.
+            // Inter-mesh on VC0 (no VC1): a packet that crosses the Z link enters this chip through the Z
+            // router, which hands it to the N or S router on VC0. Those routers therefore get one extra VC0
+            // sender channel for the Z router. E and W routers do not: a landed packet's destination is in
+            // the landing chip's column, so it never takes an X hop here.
             vc0_senders = non_express_vc0_sender_count() + 1;
         } else if (express_routing_enabled) {
             vc0_senders = express_vc0_sender_count();
