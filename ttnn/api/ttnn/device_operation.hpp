@@ -28,7 +28,6 @@
 #include <tt-metalium/experimental/program_preparation.hpp>
 #include <internal/graph_function_abort.hpp>
 #include <type_traits>
-#include "ttnn/command_list_recording.hpp"
 #include "ttnn/mesh_device_operation_adapter.hpp"
 #include "ttnn/operation_concepts.hpp"
 #include "ttnn/mesh_device_operation_utils.hpp"
@@ -225,8 +224,8 @@ void enqueue_mesh_workload(
         return;
     }
 
-    if (ttnn::experimental::detail::is_recording()) [[unlikely]] {
-        ttnn::experimental::detail::record_mesh_workload(
+    if (is_recording_command_list()) [[unlikely]] {
+        record_to_command_list(
             get_operation_name<mesh_device_operation_t>(operation_attributes), mesh_device, workload);
     } else {
         tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_device->mesh_command_queue(), workload, false);

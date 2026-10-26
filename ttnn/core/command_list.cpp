@@ -10,28 +10,24 @@
 #include <tt_stl/assert.hpp>
 #include <tt-metalium/mesh_command_queue.hpp>
 
-#include "ttnn/command_list_recording.hpp"
 #include "ttnn/core.hpp"
-
-namespace ttnn::experimental {
-
-namespace metal = tt::tt_metal::experimental;
+#include "ttnn/device_operation_detail.hpp"
 
 namespace {
 
-thread_local CommandListBuilder* t_recording = nullptr;
+thread_local ttnn::experimental::CommandListBuilder* t_recording = nullptr;
 
 }  // namespace
 
-namespace detail {
+namespace ttnn::device_operation::detail {
 
-bool is_recording() { return t_recording != nullptr; }
+bool is_recording_command_list() { return t_recording != nullptr; }
 
-void record_mesh_workload(
+void record_to_command_list(
     std::string_view operation_name,
     tt::tt_metal::distributed::MeshDevice* mesh_device,
     tt::tt_metal::distributed::MeshWorkload& workload) {
-    CommandListBuilder* builder = t_recording;
+    auto* builder = t_recording;
     TT_FATAL(builder != nullptr, "{}: no CommandListBuilder is recording on this thread", operation_name);
     TT_FATAL(
         &builder->device() == mesh_device,
@@ -44,7 +40,11 @@ void record_mesh_workload(
     }
 }
 
-}  // namespace detail
+}  // namespace ttnn::device_operation::detail
+
+namespace ttnn::experimental {
+
+namespace metal = tt::tt_metal::experimental;
 
 CommandListBuilder::CommandListBuilder(tt::tt_metal::distributed::MeshDevice& mesh_device) :
     metal_builder_(mesh_device) {}
