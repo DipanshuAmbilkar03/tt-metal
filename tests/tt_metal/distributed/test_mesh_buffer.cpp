@@ -529,7 +529,7 @@ TEST_F(MeshBufferTest2x4, GetDeviceBufferForEveryLocalDevice) {
             }
             Buffer* device_buffer = buffer->get_device_buffer(coord);
             ASSERT_NE(device_buffer, nullptr);
-            EXPECT_EQ(device_buffer->device(), mesh_device_->get_device(coord));
+            EXPECT_EQ(device_buffer->device(), tt::tt_metal::internal::get_device(*mesh_device_, coord));
             EXPECT_EQ(device_buffer->address(), buffer->address());
             EXPECT_EQ(device_buffer->size(), buffer->device_local_size());
             EXPECT_EQ(device_buffer->page_size(), buffer->page_size());
