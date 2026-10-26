@@ -10,6 +10,7 @@
 
 #include "ttnn-nanobind/activation.hpp"
 #include "ttnn-nanobind/cluster.hpp"
+#include "ttnn-nanobind/command_list.hpp"
 #include "ttnn-nanobind/core.hpp"
 #include "ttnn-nanobind/device.hpp"
 #include "ttnn-nanobind/events.hpp"
@@ -258,6 +259,7 @@ NB_MODULE(_ttnn, mod) {
     auto m_global_circular_buffer = mod.def_submodule("global_circular_buffer", "ttnn global circular buffer");
     auto m_global_semaphore = mod.def_submodule("global_semaphore", "ttnn global semaphore");
     auto m_prefetcher_pipe = mod.def_submodule("prefetcher_pipe", "ttnn prefetcher pipe (experimental)");
+    auto m_command_list = mod.def_submodule("command_list", "ttnn command lists (experimental)");
     auto m_hd_socket = mod.def_submodule("hd_socket", "ttnn host-device sockets");
     auto m_h2d_stream_service =
         mod.def_submodule("h2d_stream_service", "ttnn persistent host-to-device streaming service");
@@ -293,6 +295,7 @@ NB_MODULE(_ttnn, mod) {
     ttnn::global_circular_buffer::py_module_types(m_global_circular_buffer);
     ttnn::global_semaphore::py_module_types(m_global_semaphore);
     ttnn::prefetcher_pipe::py_module_types(m_prefetcher_pipe);
+    ttnn::command_list::py_module_types(m_command_list);
     ttnn::hd_socket::py_module_types(m_hd_socket);
     ttnn::h2d_stream_service::py_module_types(m_h2d_stream_service);
     ttnn::d2h_stream_service::py_module_types(m_d2h_stream_service);

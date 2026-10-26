@@ -9,6 +9,7 @@
 set(TTNN_CORE_SRCS
     core/async_runtime.cpp
     core/cluster.cpp
+    core/command_list.cpp
     core/config.cpp
     core/core.cpp
     core/device.cpp
@@ -114,6 +115,7 @@ set(TTNN_SRC_PYBIND
     cpp/ttnn-nanobind/__init__.cpp
     cpp/ttnn-nanobind/activation.cpp
     cpp/ttnn-nanobind/cluster.cpp
+    cpp/ttnn-nanobind/command_list.cpp
     cpp/ttnn-nanobind/core.cpp
     cpp/ttnn-nanobind/device.cpp
     cpp/ttnn-nanobind/events.cpp
@@ -187,6 +189,8 @@ set(TTNNCPP_API_HEADERS
     api/tools/profiler/op_profiler_serialize.hpp
     api/ttnn/async_runtime.hpp
     api/ttnn/cluster.hpp
+    api/ttnn/command_list.hpp
+    api/ttnn/command_list_recording.hpp
     api/ttnn/common/constants.hpp
     api/ttnn/common/guard.hpp
     api/ttnn/common/queue_id.hpp
