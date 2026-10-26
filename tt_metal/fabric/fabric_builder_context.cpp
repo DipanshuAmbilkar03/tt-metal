@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdlib>
+#include <string_view>
+
 #include <tt_stl/fmt.hpp>
 #include "tt_metal/fabric/fabric_builder_context.hpp"
 #include "tt_metal/fabric/fabric_context.hpp"
@@ -112,7 +115,8 @@ void FabricBuilderContext::compute_max_channel_counts() {
     };
 
     // Always have MESH routers
-    bool intermesh_vc_config_active = intermesh_vc_config_.requires_vc1 || intermesh_vc_config_.requires_vc2;
+    bool intermesh_vc_config_active =
+        intermesh_vc_config_.requires_vc1 || intermesh_vc_config_.requires_vc2 || intermesh_vc_config_.intermesh_on_vc0;
     possible_shapes.push_back(router_vc_shape(
         topology,
         RoutingDirection::N,
@@ -124,7 +128,8 @@ void FabricBuilderContext::compute_max_channel_counts() {
     // on the same chips (4 VC0 / 4 VC1 when non-express); enumerate both. VC1 is required because
     // the boundary shape is defined by its from-boundary VC1 fanout.
     const bool has_intermesh_z_boundary =
-        intermesh_vc_config_.requires_vc1 && fabric_has_intermesh_z_edge(control_plane.get_mesh_graph());
+        (intermesh_vc_config_.requires_vc1 || intermesh_vc_config_.intermesh_on_vc0) &&
+        fabric_has_intermesh_z_edge(control_plane.get_mesh_graph());
     if (has_intermesh_z_boundary) {
         const auto boundary_chip = chip_with_z(EdgeCapability::INTERMESH);
         possible_shapes.push_back(router_vc_shape(
@@ -379,6 +384,16 @@ IntermeshVCConfig FabricBuilderContext::compute_intermesh_vc_config() const {
 
             config = needs_mesh_pass_through ? IntermeshVCConfig::full_mesh_with_pass_through()
                                              : IntermeshVCConfig::full_mesh();
+
+            // Opt-in: inter-mesh traffic on VC0 and no VC1, so no intra-mesh router polls VC1 channels on every
+            // pass. The caller vouches that its inter-mesh traffic cannot form a buffer cycle across meshes.
+            const char* on_vc0 = std::getenv("TT_METAL_FABRIC_INTERMESH_VC0");
+            if (on_vc0 != nullptr && std::string_view(on_vc0) == "1" && !needs_mesh_pass_through) {
+                config = IntermeshVCConfig::disabled();
+                config.mode = IntermeshVCMode::FULL_MESH;
+                config.intermesh_on_vc0 = true;
+                log_info(tt::LogFabric, "Intermesh traffic on VC0, no VC1 (TT_METAL_FABRIC_INTERMESH_VC0)");
+            }
         }
     }
 

@@ -52,6 +52,12 @@ struct IntermeshVCConfig {
     bool requires_vc1_full_mesh = false;            // True if VC1 needed throughout mesh (not just edges)
     bool requires_vc1_mesh_pass_through = false;    // True if VC1 must support inter-mesh pass-through
     bool requires_vc2 = false;                      // True if VC2 needed (Blackhole + 2D + no UDM/mux)
+    // EXPERIMENT: no VC1 at all. Inter-mesh traffic crosses the Z link and lands on VC0, so every intra-mesh
+    // router is a single-mesh router. The boundary Z router fans out on VC0 and a mesh router on a boundary
+    // chip gains a VC0 slot for it (torus bubble flow control treats it as a turn). Without a separate VC,
+    // inter- and intra-mesh traffic share buffers, so this is deadlock-free only for traffic that cannot form
+    // a cycle across meshes (e.g. leased D2D streams).
+    bool intermesh_on_vc0 = false;
 
     IntermeshVCConfig() = default;
 
