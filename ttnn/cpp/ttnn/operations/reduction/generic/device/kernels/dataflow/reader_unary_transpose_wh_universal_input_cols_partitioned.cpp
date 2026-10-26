@@ -33,6 +33,7 @@ void kernel_main() {
     // {1, Ht} is the un-split reduce.
     constexpr auto num_h_slices = get_arg(args::num_h_slices);
     constexpr auto slice_Ht = get_arg(args::slice_Ht);
+    constexpr bool reduce_selects = REDUCE_OP == ckernel::PoolType::MAX || REDUCE_OP == ckernel::PoolType::MIN;
 
     // Two-pass statistics must process one column at a time. DEST_AUTO_LIMIT
     // interleaves multiple columns per chunk, which would feed the statistics
@@ -53,7 +54,8 @@ void kernel_main() {
 
 #ifndef WELFORD_TWO_PASS
     const float scaler_f = __builtin_bit_cast(float, scaler_bits);
-    dataflow_kernel_lib::prepare_reduce_scaler<dfb::scaler, REDUCE_OP, REDUCE_DIM>(scaler_f);
+    DataflowBuffer dfb_scaler(dfb::scaler);
+    dataflow_kernel_lib::prepare_reduce_scaler<dfb::scaler, REDUCE_OP, REDUCE_DIM>(dfb_scaler, scaler_f);
 #endif
 
     auto tensor_accessor = TensorAccessor(tensor::src);
@@ -93,6 +95,8 @@ void kernel_main() {
                     if (filled == 0) {
                         dfb_in0.reserve_back(tiles_per_batch);
                     }
+                    // Trailing slices run past Ht. Zero is the SUM identity but not MAX/MIN's, so
+                    // those re-read the last real tile, which cannot change the selected value.
                     if (ht < Ht) {
                         noc.async_read(
                             tensor_accessor,
@@ -100,8 +104,14 @@ void kernel_main() {
                             tile_bytes,
                             {.page_id = nc * HtWt + ht * Wt + wt},
                             {.offset_bytes = filled * tile_bytes});
+                    } else if constexpr (reduce_selects) {
+                        noc.async_read(
+                            tensor_accessor,
+                            dfb_in0,
+                            tile_bytes,
+                            {.page_id = nc * HtWt + (Ht - 1) * Wt + wt},
+                            {.offset_bytes = filled * tile_bytes});
                     } else {
-                        // slice_Ht is rounded up; pad past Ht with the SUM identity.
                         noc.async_write_zeros(dfb_in0, tile_bytes, {.offset_bytes = filled * tile_bytes});
                         padded = true;
                     }
