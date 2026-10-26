@@ -1166,7 +1166,7 @@ def pytest_runtest_setup(item):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session):
-    if hasattr(session.config, "workerinput"):
+    if _HARDWARE_FREE or hasattr(session.config, "workerinput"):
         return
     # Under xdist no test runs on the controller; start the host before xdist's (trylast)
     # pytest_sessionstart spawns the workers.
