@@ -60,7 +60,7 @@ StreamDecoder::StreamDecoder(const CaptureContext::Device& dev, RecordRoutes& ro
 namespace {
 
 void write_direct(
-    const DirectForm& form,
+    const PayloadToRecord& payload_to_record,
     const uint32_t* src,
     uint32_t payload_at,
     uint64_t time,
@@ -71,15 +71,15 @@ void write_direct(
     uint8_t* const record_time = dst + profiler::kSpscTimeAt;
     std::memcpy(record_time, &time, sizeof(time));
     const auto* payload = reinterpret_cast<const std::byte*>(src + payload_at);
-    for (const DirectForm::Field& field : form.fields) {
+    for (const PayloadToRecord::Field& field : payload_to_record.fields) {
         uint8_t* const out = dst + field.to;
-        if (field.op == DirectForm::Op::Copy) {
+        if (field.op == PayloadToRecord::Op::Copy) {
             const uint64_t value = field_value(payload, field.bit, field.width, field.code);
             std::memcpy(out, &value, code_bytes(field.code));
             continue;
         }
         const uint64_t sent =
-            field.op == DirectForm::Op::Published ? 0 : field_value(payload, field.bit, field.width, field.code);
+            field.op == PayloadToRecord::Op::Published ? 0 : field_value(payload, field.bit, field.width, field.code);
         const uint64_t ticks = timestamp_ticks(field.op, time, sent);
         std::memcpy(out, &ticks, sizeof(ticks));
         std::memcpy(out + sizeof(ticks), record_time + sizeof(ticks), sizeof(uint64_t));
@@ -98,8 +98,8 @@ void write_direct(
     if (!has_type(direct_types_, type)) {
         written.value_count = profiler::spsc_published(src, packet.payload_at, payload_words, consts, dst, values);
         std::memcpy(written.time_slot, &packet.time, sizeof(packet.time));
-    } else if (packet.form != nullptr) {
-        write_direct(*packet.form, src, packet.payload_at, packet.time, consts, dst);
+    } else if (packet.payload_to_record != nullptr) {
+        write_direct(*packet.payload_to_record, src, packet.payload_at, packet.time, consts, dst);
     } else {
         profiler::spsc_record(src, payload_words, consts, dst);
     }
@@ -153,8 +153,9 @@ void write_direct(
     }
     reinterpret_cast<uint64_t*>(lane.last_time)[0] -= kEpoch;
     uint8_t* const record = lane.last_time - profiler::kSpscTimeAt;
-    const std::span<const uint32_t> follows_time =
-        lane.last_form != nullptr ? std::span(lane.last_form->follows_time) : std::span<const uint32_t>();
+    const std::span<const uint32_t> follows_time = lane.last_payload_to_record != nullptr
+                                                       ? std::span(lane.last_payload_to_record->follows_time)
+                                                       : std::span<const uint32_t>();
     for (const uint32_t at : follows_time) {
         uint64_t ticks = 0;
         std::memcpy(&ticks, record + at, sizeof(ticks));
@@ -357,7 +358,7 @@ StreamDecoder::Produced StreamDecoder::decode(
                         lane.cursor = block.last_time;
                         lane.last_ts = block.last_time;
                         lane.last_time = dst + (block.count - 1) * short_run.layout.stride + kSpscTimeAt;
-                        lane.last_form = short_run.form;
+                        lane.last_payload_to_record = short_run.payload_to_record;
                         if constexpr (kWritesOrder) {
                             order_out = std::fill_n(order_out, block.count, type);
                         }
@@ -380,7 +381,9 @@ StreamDecoder::Produced StreamDecoder::decode(
                             .src = src,
                             .payload_at = 1 + uint32_t(form),  // word 0, then the form's time words
                             .time = timestamp,
-                            .form = route.forms != nullptr ? &(*route.forms)[uint32_t(form)] : nullptr};
+                            .payload_to_record = route.payload_to_record != nullptr
+                                                     ? &(*route.payload_to_record)[uint32_t(form)]
+                                                     : nullptr};
                         uint64_t* const values = values_out + value_count_out;
                         Written written{.time_slot = reinterpret_cast<uint8_t*>(&lane.unrouted_time), .value_count = 0};
                         if (std::has_single_bit(route.types)) {
@@ -390,7 +393,8 @@ StreamDecoder::Produced StreamDecoder::decode(
                         }
                         value_count_out += written.value_count;
                         lane.last_time = written.time_slot;
-                        lane.last_form = (route.types & direct_types_) != 0 ? packet.form : nullptr;
+                        lane.last_payload_to_record =
+                            (route.types & direct_types_) != 0 ? packet.payload_to_record : nullptr;
                         if constexpr (kWritesOrder) {
                             for (uint64_t types = route.types; types != 0; types &= types - 1) {
                                 *order_out++ = std::countr_zero(types);

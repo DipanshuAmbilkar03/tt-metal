@@ -240,11 +240,11 @@ int main() {
                 record->start = data.leaf<sp::Timestamp>();
                 record->end = data.leaf<sp::Timestamp>();
             };
-        using Op = streaming_profiler::DirectForm::Op;
-        streaming_profiler::DirectForms forms;
+        using Op = streaming_profiler::PayloadToRecord::Op;
+        streaming_profiler::PayloadToRecordByTimeForm by_time_form;
         constexpr uint32_t kDistanceBits[] = {16, 32, 64};
         for (uint32_t form = 0; form < 3; form++) {
-            forms[form] = {
+            by_time_form[form] = {
                 .fields =
                     {{Op::Distance, kTimes[0], offsetof(Direct, start), 0, kDistanceBits[form]},
                      {Op::Published, kTimes[1], offsetof(Direct, end), 0, 0}},
@@ -253,7 +253,8 @@ int main() {
         const sp::detail::Kind kind{.data_codes = kTimes, .size = sizeof(Direct), .build = build};
         {
             Harness h({kind});
-            h.routes.set_route(8, {.types = 1, .short_length = 1, .full_length = 4, .forms = &forms});
+            h.routes.set_route(
+                8, {.types = 1, .short_length = 1, .full_length = 4, .payload_to_record = &by_time_form});
             const uint64_t far = kEpoch + 50;
             h.feed(
                 {sticky(2),
@@ -286,7 +287,8 @@ int main() {
         }
         {
             Harness h({kind});
-            h.routes.set_route(8, {.types = 1, .short_length = 1, .full_length = 4, .forms = &forms});
+            h.routes.set_route(
+                8, {.types = 1, .short_length = 1, .full_length = 4, .payload_to_record = &by_time_form});
             h.feed({sticky(1), record(2, 8), kNear, 8, record(2, 8), 4, 0});
             const Direct& torn = h.records<Direct>()[0];
             check(
@@ -302,7 +304,11 @@ int main() {
             Harness h({kind, kind});
             for (const uint32_t id : {8u, 9u, 10u}) {
                 h.routes.set_route(
-                    id, {.types = id == 10 ? 2u : 1u, .short_length = 1, .full_length = 4, .forms = &forms});
+                    id,
+                    {.types = id == 10 ? 2u : 1u,
+                     .short_length = 1,
+                     .full_length = 4,
+                     .payload_to_record = &by_time_form});
             }
             struct Expected {
                 uint32_t id;
@@ -334,7 +340,8 @@ int main() {
         }
         {
             Harness h({kRawKind, kind});
-            h.routes.set_route(8, {.types = 0b10, .short_length = 1, .full_length = 4, .forms = &forms});
+            h.routes.set_route(
+                8, {.types = 0b10, .short_length = 1, .full_length = 4, .payload_to_record = &by_time_form});
             h.feed(
                 {sticky(2),
                  record(2, 8),

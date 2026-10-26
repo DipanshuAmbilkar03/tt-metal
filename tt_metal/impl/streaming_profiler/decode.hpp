@@ -31,48 +31,14 @@ struct CallSite;
 
 namespace tt::tt_metal::streaming_profiler {
 
-template <typename T>
-T load_unaligned(const std::byte* at) {
-    T value;
-    std::memcpy(&value, at, sizeof(value));
-    return value;
-}
-
-// The `width` bits from bit `bit` of `bytes`, sign-extended for a signed field.
-inline uint64_t field_value(const std::byte* bytes, uint32_t bit, uint32_t width, uint16_t code) {
-    const std::byte* const at = bytes + bit / 8;
-    const uint32_t shift = bit % 8;
-    uint64_t value = 0;
-    if (shift == 0 && width == 8 * experimental::streaming_profiler::detail::code_bytes(code)) {
-        // A field in whole bytes of its own size, as most are, loads just those bytes.
-        switch (width) {
-            case 8: value = std::to_integer<uint8_t>(*at); break;
-            case 16: value = load_unaligned<uint16_t>(at); break;
-            case 32: value = load_unaligned<uint32_t>(at); break;
-            default: value = load_unaligned<uint64_t>(at); break;
-        }
-    } else {
-        std::array<std::byte, 16> window{};
-        std::memcpy(window.data(), at, (shift + width + 7) / 8);
-        uint64_t low = 0, high = 0;
-        std::memcpy(&low, window.data(), sizeof(low));
-        std::memcpy(&high, window.data() + sizeof(low), sizeof(high));
-        value = shift == 0 ? low : low >> shift | high << (64 - shift);
-    }
-    if (width < 64) {
-        const uint64_t mask = (uint64_t{1} << width) - 1;
-        const bool negative = (code >> 8) == 'i' && (value >> (width - 1) & 1) != 0;
-        value = negative ? value | ~mask : value & mask;
-    }
-    return value;
-}
+using experimental::streaming_profiler::detail::field_value;
 
 // A wall-clock read that tore comes out this many ticks high.
 inline constexpr uint64_t kEpoch = uint64_t{1} << 32;
 
-// How a form's payload fills a record the decoder writes directly: each data field from its bits in the payload to its
-// bytes in the record.
-struct DirectForm {
+// How a packet layout's payload fills a record the decoder writes directly: each data field from its bits in the
+// payload to its bytes in the record.
+struct PayloadToRecord {
     enum class Op : uint8_t {
         Copy,       // the field's bits
         Distance,   // a Timestamp sent as its distance back from the record's time
@@ -90,13 +56,15 @@ struct DirectForm {
 };
 // The core read the Timestamp before the record, and a read that tore came out 2^32 ticks high, which puts it after the
 // record by up to 2^32 ticks.
-inline uint64_t timestamp_ticks(DirectForm::Op op, uint64_t time, uint64_t sent) {
-    const uint64_t ticks = op == DirectForm::Op::Published ? time : op == DirectForm::Op::Distance ? time - sent : sent;
+inline uint64_t timestamp_ticks(PayloadToRecord::Op op, uint64_t time, uint64_t sent) {
+    const uint64_t ticks = op == PayloadToRecord::Op::Published  ? time
+                           : op == PayloadToRecord::Op::Distance ? time - sent
+                                                                 : sent;
     return ticks > time && ticks - time <= kEpoch ? ticks - kEpoch : ticks;
 }
-// A call site's forms for its direct types, indexed by TimeForm. Those types all hold the site's data, so they share
-// one layout.
-using DirectForms = std::array<DirectForm, 3>;
+// How each of a call site's packet layouts fills a record of its direct types, indexed by TimeForm. Those types all
+// hold the site's data, so they share one record layout.
+using PayloadToRecordByTimeForm = std::array<PayloadToRecord, 3>;
 
 inline bool has_type(uint64_t types, uint32_t type) { return (types >> type & 1) != 0; }
 
@@ -112,7 +80,8 @@ struct SpscLane {
     // valid only until the batch numbered last_time_seq is delivered.
     uint8_t* last_time = nullptr;
     uint64_t last_time_seq = 0;
-    const DirectForm* last_form = nullptr;  // the last record's form, when the decoder wrote it directly
+    // How the last record's payload filled it, when the decoder wrote it directly.
+    const PayloadToRecord* last_payload_to_record = nullptr;
     // Where the time of a record no type takes goes, so that a repair of it has somewhere to write. Nothing reads it.
     uint64_t unrouted_time = 0;
     bool seeded = false;
@@ -140,13 +109,14 @@ public:
         uint64_t types = 0;                         // a bit per type of the consumer's the call site sends
         uint8_t short_length = 0, full_length = 0;  // its short and full forms' body lengths, 0 for a form it lacks
         bool resolved = false;                      // set when set_route() takes it
-        const DirectForms* forms = nullptr;         // for its direct types, null when its payload is their data as is
+        // For its direct types, null when its payload is their data as is.
+        const PayloadToRecordByTimeForm* payload_to_record = nullptr;
     };
-    // A direct type's short-record layout, which all its call sites share, and the first site's short form, whose
-    // Timestamps that follow the record's time a repair moves for every site.
+    // A direct type's short-record layout, which all its call sites share, and how the first site's short payload fills
+    // a record, whose Timestamps that follow the record's time a repair moves for every site.
     struct ShortRun {
         profiler::SpscShortLayout layout;
-        const DirectForm* form;
+        const PayloadToRecord* payload_to_record;
     };
     explicit RecordRoutes(std::vector<experimental::streaming_profiler::detail::Kind> kinds);
 
@@ -168,7 +138,8 @@ public:
 
 private:
     friend class StreamDecoder;
-    const DirectForms* direct_forms(const tt::llrt::CallSite& site, std::span<const uint32_t> field_offsets);
+    const PayloadToRecordByTimeForm* payload_to_record_by_time_form(
+        const tt::llrt::CallSite& site, std::span<const uint32_t> field_offsets);
     // The bit of the type whose short records spsc_short_records() writes in runs for a route's call site, or 0. A site
     // takes the run kernel when it sends one direct type and its short records are 2 words.
     uint64_t short_run_type(const Route& route);
@@ -181,7 +152,7 @@ private:
     uint64_t direct_types_ = 0;
     std::array<std::vector<uint32_t>, kMaxTypes> field_offsets_;
     std::array<std::vector<uint32_t>, kMaxTypes> time_offsets_;
-    std::deque<DirectForms> forms_;
+    std::deque<PayloadToRecordByTimeForm> payload_to_record_by_time_form_;
     std::array<std::optional<ShortRun>, kMaxTypes> short_runs_;
     std::unordered_map<uint64_t, std::vector<uint8_t>> alternatives_;
 };
@@ -233,7 +204,7 @@ private:
         const uint32_t* src;
         uint32_t payload_at;
         uint64_t time;
-        const DirectForm* form;
+        const PayloadToRecord* payload_to_record;
     };
     // Aligned to 64 bytes, since where the loop falls across cache lines moves its time per record by 3%.
     template <bool kWritesOrder>

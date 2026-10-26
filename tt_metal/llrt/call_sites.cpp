@@ -13,7 +13,11 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <string>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <tt-logger/tt-logger.hpp>
@@ -75,26 +79,22 @@ private:
 
 // The stall call site, which kernel_profiler::write_pending_stall() writes without an entry in any ELF: a zone named
 // STALL_ZONE_NAME whose records all take the medium form, its end the record's time and its start a 32-bit distance
-// before its end. Its name is the String with hash 0 of its own strings.
+// before its end.
 CallSite make_stall_site() {
-    auto strings = std::make_shared<CallSiteStrings>();
-    strings->text.assign(sp::STALL_ZONE_NAME.begin(), sp::STALL_ZONE_NAME.end());
-    strings->by_hash.emplace(0, std::string_view(strings->text.data(), strings->text.size()));
     return {
         .metadata_type = spd::type_name<sp::ZoneMetadata>,
         .data_codes = {spd::kTimestampCode, spd::kTimestampCode},
         .metadata_codes = {spd::kStringCode},
         .metadata_bits = {{0, 64}},
-        .values = {{.type = spd::type_name<sp::Interval>, .first_field = 0, .field_bits = {{0, 64}, {64, 64}}}},
-        .value_fields = {2},
-        .forms =
+        .arguments = {{.type = spd::type_name<sp::Interval>, .first_field = 0, .field_bits = {{0, 64}, {64, 64}}}},
+        .argument_field_counts = {2},
+        .packet_layouts =
             {{.time_form = spd::TimeForm::Medium,
               .body_words = kernel_profiler::ppfmt::STALL_BODY_WORDS,
               .data_bits = {{0, 32}, {0, 0}}}},
         .timestamps_as_distances = true,
         .published_field = 1,
-        .metadata = std::vector<std::byte>(sizeof(uint64_t)),
-        .strings = std::move(strings)};
+        .metadata = {sp::STALL_ZONE_NAME}};
 }
 
 struct Registry {
@@ -166,151 +166,173 @@ std::vector<FieldBits> read_field_bits(
     return bits;
 }
 
-// An image's Strings by hash. Each translation unit has its own entry for a text it uses, so a text repeats; two
-// different texts with one hash fail the load.
-void read_strings(CallSiteStrings& strings, const Section& table, const std::string& elf_path) {
-    for (const spd::RecordString& entry :
-         table.read_table<spd::RecordString>(table.vma, table.bytes.size() / sizeof(spd::RecordString))) {
-        const uint64_t offset = uint64_t{entry.text} - strings.vma;
-        TT_FATAL(
-            offset < strings.text.size() && entry.size < strings.text.size() - offset,
-            "streaming profiler: '{}' has a string outside its .tt_record_data",
-            elf_path);
-        const std::string_view text(strings.text.data() + offset, entry.size);
-        const auto [held, added] = strings.by_hash.try_emplace(entry.hash, text);
-        TT_FATAL(
-            added || held->second == text,
-            "streaming profiler: '{}' has two strings with one hash, \"{}\" and \"{}\"; change either text",
-            elf_path,
-            held->second,
-            text);
-    }
+// A text a call site names, kept for the life of the process.
+std::string_view keep(std::string_view text) {
+    static ttsl::Indestructible<std::pair<std::mutex, std::set<std::string, std::less<>>>> kept;
+    auto& [mutex, texts] = kept.get();
+    const std::lock_guard lock(mutex);
+    return *texts.emplace(text).first;
 }
 
-// Every String in a call site's metadata has its text in the image.
-void check_metadata_strings(const CallSite& site, const std::string& elf_path) {
-    for (size_t field = 0; field < site.metadata_codes.size(); field++) {
-        if (site.metadata_codes[field] != spd::kStringCode) {
-            continue;
+// An image's texts: those in its .tt_record_data at a link address, and its Strings by hash, from its
+// .tt_record_strings. Each translation unit has its own entry for a text it uses, so a text repeats; two different
+// texts with one hash fail the load, as does a String the image has no text for.
+class ImageStrings {
+public:
+    ImageStrings(const Section& data, const Section& table, const std::string& elf_path) :
+        data_(data), elf_path_(elf_path) {
+        for (const spd::StringEntry& entry :
+             table.read_table<spd::StringEntry>(table.vma, table.bytes.size() / sizeof(spd::StringEntry))) {
+            const std::string_view text = at(entry.text).substr(0, entry.size);
+            const auto [held, added] = by_hash_.try_emplace(entry.hash, text);
+            TT_FATAL(
+                added || held->second == text,
+                "streaming profiler: '{}' has two strings with one hash, \"{}\" and \"{}\"; change either text",
+                elf_path,
+                held->second,
+                text);
         }
-        uint64_t hash = 0;
-        std::memcpy(&hash, site.metadata.data() + site.metadata_bits[field].bit / 8, sizeof(hash));
-        TT_FATAL(
-            site.strings->by_hash.contains(hash),
-            "streaming profiler: '{}': {}:{} names a string that isn't in the image's .tt_record_strings",
-            elf_path,
-            site.location.file,
-            site.location.line);
     }
+    // The text at `address`, up to its NUL.
+    std::string_view at(uint32_t address) const {
+        const uint64_t offset = uint64_t{address} - data_.vma;
+        if (offset >= data_.bytes.size()) {
+            return {};
+        }
+        const std::string_view rest(
+            reinterpret_cast<const char*>(data_.bytes.data()) + offset, data_.bytes.size() - offset);
+        return rest.substr(0, rest.find('\0'));
+    }
+    std::string_view of(uint64_t hash) const {
+        const auto found = by_hash_.find(hash);
+        TT_FATAL(found != by_hash_.end(), "streaming profiler: '{}' names a string it has no text for", elf_path_);
+        return found->second;
+    }
+
+private:
+    const Section& data_;
+    const std::string& elf_path_;
+    std::unordered_map<uint64_t, std::string_view> by_hash_;
+};
+
+// The metadata's fields, read out of the struct as the device compiler laid it out, each String as its text.
+std::vector<std::variant<uint64_t, std::string_view>> read_metadata(
+    const CallSite& site, std::span<const std::byte> metadata, const ImageStrings& strings) {
+    std::vector<std::variant<uint64_t, std::string_view>> values;
+    for (size_t field = 0; field < site.metadata_codes.size(); field++) {
+        const uint16_t code = site.metadata_codes[field];
+        const FieldBits bits = site.metadata_bits[field];
+        const uint64_t value = spd::field_value(metadata.data(), bits.bit, bits.width, code);
+        if (code == spd::kStringCode) {
+            values.emplace_back(keep(strings.of(value)));
+        } else {
+            values.emplace_back(value);
+        }
+    }
+    return values;
 }
 
-// A form sends a Timestamp's distance in the copy that starts where the Timestamp does.
-FieldBits find_in_payload(std::span<const spd::RecordCopy> copies, uint32_t value, FieldBits field, bool as_distance) {
-    for (const spd::RecordCopy& copy : copies) {
+// A form sends a Timestamp's distance in the slice that starts where the Timestamp does.
+FieldBits find_in_payload(
+    std::span<const spd::ArgumentSlice> slices, uint32_t argument, FieldBits field, bool as_distance) {
+    for (const spd::ArgumentSlice& slice : slices) {
         const bool holds =
-            as_distance ? 8u * copy.from == field.bit
-                        : 8u * copy.from <= field.bit && field.bit + field.width <= 8u * (copy.from + copy.bytes);
-        if (copy.value == value && holds) {
-            return {field.bit - 8u * copy.from + 8u * copy.to, as_distance ? 8u * copy.bytes : field.width};
+            as_distance ? 8u * slice.from == field.bit
+                        : 8u * slice.from <= field.bit && field.bit + field.width <= 8u * (slice.from + slice.bytes);
+        if (slice.argument == argument && holds) {
+            return {field.bit - 8u * slice.from + 8u * slice.to, as_distance ? 8u * slice.bytes : field.width};
         }
     }
     return {};
 }
 
-// A data field: the value holding it, and its bits in that value.
-struct ValueField {
-    uint32_t value;
+// A data field: the argument holding it, and its bits in that argument.
+struct ArgumentField {
+    uint32_t argument;
     FieldBits bits;
 };
 
-// Adds the call site's values, and returns each data field where its value holds it, an array value's fields once per
-// element.
-std::vector<ValueField> read_values(CallSite& site, std::span<const spd::RecordValue> values, const Section& data) {
-    std::vector<ValueField> fields;
+// Adds the call site's arguments, and returns each data field where its argument holds it, an array argument's fields
+// once per element.
+std::vector<ArgumentField> read_arguments(
+    CallSite& site, std::span<const spd::CallArgument> arguments, const Section& data, const ImageStrings& strings) {
+    std::vector<ArgumentField> fields;
     uint32_t first_field = 0;
-    for (const spd::RecordValue& value : values) {
-        const auto codes = std::span(site.data_codes).subspan(first_field, value.field_count);
+    for (const spd::CallArgument& argument : arguments) {
+        const auto codes = std::span(site.data_codes).subspan(first_field, argument.field_count);
         std::vector<FieldBits> bits =
-            value.samples != 0
-                ? read_field_bits(data, value.samples, value.size, codes, site.strings->string_at(value.type))
+            argument.samples != 0
+                ? read_field_bits(data, argument.samples, argument.size, codes, strings.at(argument.type))
                 : std::vector{FieldBits{0, 8 * spd::code_bytes(codes[0])}};
-        for (uint32_t element = 0; element < value.count; element++) {
+        for (uint32_t element = 0; element < argument.count; element++) {
             for (const FieldBits& field : bits) {
-                fields.push_back({uint32_t(site.values.size()), {field.bit + 8 * element * value.size, field.width}});
+                fields.push_back(
+                    {uint32_t(site.arguments.size()), {field.bit + 8 * element * argument.size, field.width}});
             }
         }
-        site.values.push_back(
-            {.type = site.strings->string_at(value.type),
+        site.arguments.push_back(
+            {.type = keep(strings.at(argument.type)),
              .first_field = first_field,
-             .is_array = value.is_array != 0,
+             .is_array = argument.is_array != 0,
              .field_bits = std::move(bits)});
-        site.value_fields.push_back(value.field_count * value.count);
-        first_field += value.field_count * value.count;
+        site.argument_field_counts.push_back(argument.field_count * argument.count);
+        first_field += argument.field_count * argument.count;
     }
     return fields;
 }
 
-// Each data field's bits in a form's payload, which the form's copies give. A struct travels as its bytes up to where
+// Each data field's bits in a form's payload, which the form's slices give. A struct travels as its bytes up to where
 // its field types alone would end it, which misses a field that alignas moved past that end. The field a record is
 // published into isn't sent.
 std::vector<FieldBits> find_payload_bits(
-    const CallSite& site, std::span<const ValueField> fields, std::span<const spd::RecordCopy> copies) {
+    const CallSite& site, std::span<const ArgumentField> fields, std::span<const spd::ArgumentSlice> slices) {
     std::vector<FieldBits> bits;
     for (uint32_t field = 0; field < fields.size(); field++) {
-        const auto [value, bits_in_value] = fields[field];
+        const auto [argument, bits_in_argument] = fields[field];
         const bool as_distance = site.timestamps_as_distances && site.data_codes[field] == spd::kTimestampCode;
-        bits.push_back(find_in_payload(copies, value, bits_in_value, as_distance));
+        bits.push_back(find_in_payload(slices, argument, bits_in_argument, as_distance));
         TT_FATAL(
             bits.back().width != 0 || field == site.published_field,
             "streaming profiler: {}:{}: field {} of {} lies past the bytes a record carries because of an alignas; "
             "remove the alignas or move the field earlier",
             site.location.file,
             site.location.line,
-            (field - site.values[value].first_field) % site.values[value].field_bits.size(),
-            site.values[value].type.empty() ? "a value" : site.values[value].type);
+            (field - site.arguments[argument].first_field) % site.arguments[argument].field_bits.size(),
+            site.arguments[argument].type.empty() ? "an argument" : site.arguments[argument].type);
     }
     return bits;
 }
 
 std::vector<std::pair<uint32_t, CallSite>> read_call_sites(const std::string& elf_path, const ll_api::ElfFile& elf) {
     const Section meta(elf, ".tt_record_meta"), data(elf, ".tt_record_data"), string_table(elf, ".tt_record_strings");
-    auto image_strings = std::make_shared<CallSiteStrings>(
-        CallSiteStrings{.text = data.read_table<char>(data.vma, data.bytes.size()), .vma = data.vma});
-    read_strings(*image_strings, string_table, elf_path);
-    const std::shared_ptr<const CallSiteStrings> strings = std::move(image_strings);
+    const ImageStrings strings(data, string_table, elf_path);
     std::vector<std::pair<uint32_t, CallSite>> sites;
-    for (const spd::RecordSiteEntry& entry :
-         meta.read_table<spd::RecordSiteEntry>(meta.vma, meta.bytes.size() / sizeof(spd::RecordSiteEntry))) {
-        TT_FATAL(
-            strings->by_hash.contains(entry.file),
-            "streaming profiler: '{}': a call site's file name isn't in the image's .tt_record_strings",
-            elf_path);
+    for (const spd::CallSiteEntry& entry :
+         meta.read_table<spd::CallSiteEntry>(meta.vma, meta.bytes.size() / sizeof(spd::CallSiteEntry))) {
         CallSite site{
             .location =
-                {.file = strings->string_of(entry.file),
-                 .function = strings->string_at(entry.function),
+                {.file = keep(strings.of(entry.file)),
+                 .function = keep(strings.at(entry.function)),
                  .line = entry.line},
-            .metadata_type = strings->string_at(entry.metadata_type),
+            .metadata_type = keep(strings.at(entry.metadata_type)),
             .data_codes = data.read_table<uint16_t>(entry.data_codes, entry.data_field_count),
             .metadata_codes = data.read_table<uint16_t>(entry.metadata_codes, entry.metadata_field_count),
-            .published_field = entry.data_published_field,
-            .metadata = data.read_table<std::byte>(entry.metadata, entry.metadata_size),
-            .strings = strings};
+            .published_field = entry.data_published_field};
         site.metadata_bits =
             read_field_bits(data, entry.metadata_samples, entry.metadata_size, site.metadata_codes, site.metadata_type);
-        check_metadata_strings(site, elf_path);
-        const std::vector<ValueField> fields =
-            read_values(site, data.read_table<spd::RecordValue>(entry.data_values, entry.data_value_count), data);
+        site.metadata = read_metadata(site, data.read_table<std::byte>(entry.metadata, entry.metadata_size), strings);
+        const std::vector<ArgumentField> fields = read_arguments(
+            site, data.read_table<spd::CallArgument>(entry.data_arguments, entry.data_argument_count), data, strings);
         // Only data whose Timestamps travel as distances has a full form.
-        const auto forms = data.read_table<spd::RecordForm>(entry.data_forms, entry.data_form_count);
+        const auto layouts = data.read_table<spd::PacketLayout>(entry.data_layouts, entry.data_layout_count);
         site.timestamps_as_distances =
-            std::ranges::find(forms, spd::TimeForm::Full, &spd::RecordForm::time_form) != forms.end();
-        for (const spd::RecordForm& form : forms) {
-            site.forms.push_back(
-                {.time_form = form.time_form,
-                 .body_words = form.body_words,
-                 .data_bits =
-                     find_payload_bits(site, fields, data.read_table<spd::RecordCopy>(form.copies, form.copy_count))});
+            std::ranges::find(layouts, spd::TimeForm::Full, &spd::PacketLayout::time_form) != layouts.end();
+        for (const spd::PacketLayout& layout : layouts) {
+            site.packet_layouts.push_back(
+                {.time_form = layout.time_form,
+                 .body_words = layout.body_words,
+                 .data_bits = find_payload_bits(
+                     site, fields, data.read_table<spd::ArgumentSlice>(layout.slices, layout.slice_count))});
         }
         sites.emplace_back(entry.id, std::move(site));
     }
@@ -358,12 +380,12 @@ void load_call_sites(const std::string& elf_path, ll_api::ElfFile& elf) {
     const std::lock_guard lock(registry.mutex);
     for (auto& [id, site] : sites) {
         registry.types.add_device_type(site.metadata_type, site.metadata_codes, site.metadata_bits);
-        for (const CallSite::Value& value : site.values) {
-            if (!value.type.empty()) {
+        for (const CallSite::Argument& argument : site.arguments) {
+            if (!argument.type.empty()) {
                 registry.types.add_device_type(
-                    value.type,
-                    std::span(site.data_codes).subspan(value.first_field, value.field_bits.size()),
-                    value.field_bits);
+                    argument.type,
+                    std::span(site.data_codes).subspan(argument.first_field, argument.field_bits.size()),
+                    argument.field_bits);
             }
         }
         registry.by_id[id].store(&registry.sites.emplace_back(std::move(site)), std::memory_order_release);

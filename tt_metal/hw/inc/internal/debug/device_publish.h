@@ -81,11 +81,11 @@ template <typename... Args>
 using RecordData = typename RecordDataOf<Args...>::type;
 
 template <typename Data>
-using ValueList = std::conditional_t<spd::is_tuple<Data>, Data, std::tuple<Data>>;
+using ArgumentList = std::conditional_t<spd::is_tuple<Data>, Data, std::tuple<Data>>;
 template <typename Data, size_t I>
-using ValueAt = std::tuple_element_t<I, ValueList<Data>>;
+using ArgumentAt = std::tuple_element_t<I, ArgumentList<Data>>;
 template <typename Data>
-using ValueIndices = std::make_index_sequence<std::tuple_size_v<ValueList<Data>>>;
+using ArgumentIndices = std::make_index_sequence<std::tuple_size_v<ArgumentList<Data>>>;
 
 // A zone's data, the time it opened. Its call site describes its records as Intervals whose end, their second field, is
 // when they are published, which the host fills in.
@@ -134,8 +134,8 @@ constexpr CodeLayout lay_out_codes(const uint16_t* codes, size_t& next_code, uin
 }
 
 // Where V's fields are as its field codes lay V out, and whether that layout is the compiler's, which it is when it
-// gives V's own size and alignment (an empty V has neither). A record sends a value's first sent_bytes: up to the end
-// of its last field when the layouts match, all of it when they don't.
+// gives V's own size and alignment (an empty V has neither). A record sends an argument's first sent_bytes: up to the
+// end of its last field when the layouts match, all of it when they don't.
 template <size_t kLeaves>
 struct FieldLayout {
     bool matches_compiler = false;
@@ -186,81 +186,81 @@ constexpr bool holds(uint16_t code) {
     return false;
 }
 
-// A Timestamp travels as a distance when the field codes describe every value's layout; otherwise it goes whole.
+// A Timestamp travels as a distance when the field codes describe every argument's layout; otherwise it goes whole.
 template <typename Data, size_t... I>
 constexpr bool sends_distances(std::index_sequence<I...>) {
-    return holds<Data>(spd::kTimestampCode) && (kFieldLayout<ValueAt<Data, I>>.matches_compiler && ...);
+    return holds<Data>(spd::kTimestampCode) && (kFieldLayout<ArgumentAt<Data, I>>.matches_compiler && ...);
 }
 template <typename Data>
-inline constexpr bool kSendsDistances = sends_distances<Data>(ValueIndices<Data>{});
+inline constexpr bool kSendsDistances = sends_distances<Data>(ArgumentIndices<Data>{});
 
-// A record's payload is made of pieces of its values. Each piece is 1, 2, 4 or 8 bytes at a multiple of its size within
-// its value, so it loads whole. When the field codes describe a value's layout, its pieces are its fields and every
-// byte before its last field's end that no field covers, so a bit-field the codes place elsewhere still goes out.
-// Otherwise they are the whole value cut at its alignment, at most 8 bytes each.
-struct Piece {
+// A record's payload is made of slices of its arguments. Each slice is 1, 2, 4 or 8 bytes at a multiple of its size
+// within its argument, so it loads whole. When the field codes describe an argument's layout, its slices are its fields
+// and every byte before its last field's end that no field covers, so a bit-field the codes place elsewhere still goes
+// out. Otherwise they are the whole argument cut at its alignment, at most 8 bytes each.
+struct Slice {
     bool is_distance;
-    uint16_t value, from, bytes;  // the value it is from, its offset in that value, and its size
+    uint16_t argument, from, bytes;  // the argument it is from, its offset in that argument, and its size
 };
 template <typename V>
-inline constexpr uint16_t kWholePieceBytes = uint16_t(std::min<size_t>(alignof(V), 8));
+inline constexpr uint16_t kWholeSliceBytes = uint16_t(std::min<size_t>(alignof(V), 8));
 template <typename V>
-inline constexpr size_t kValuePieces =
+inline constexpr size_t kArgumentSlices =
     kFieldLayout<V>.matches_compiler ? spd::leaf_type_codes<V>.size() + kFieldLayout<V>.gap_bytes
-                                     : sizeof(V) / kWholePieceBytes<V>;
+                                     : sizeof(V) / kWholeSliceBytes<V>;
 template <typename V>
-constexpr std::array<Piece, kValuePieces<V>> value_pieces(uint16_t value, bool as_distances) {
-    std::array<Piece, kValuePieces<V>> pieces{};
+constexpr std::array<Slice, kArgumentSlices<V>> argument_slices(uint16_t argument, bool as_distances) {
+    std::array<Slice, kArgumentSlices<V>> slices{};
     if constexpr (kFieldLayout<V>.matches_compiler) {
         constexpr auto& layout = kFieldLayout<V>;
         size_t k = 0;
         for (; k < layout.offsets.size(); ++k) {
             const bool is_distance = as_distances && spd::leaf_type_codes<V>[k] == spd::kTimestampCode;
-            pieces[k] = {is_distance, value, layout.offsets[k], layout.sizes[k]};
+            slices[k] = {is_distance, argument, layout.offsets[k], layout.sizes[k]};
         }
         for (uint32_t byte = 0; byte < layout.sent_bytes; ++byte) {
             if (!layout.is_covered(byte)) {
-                pieces[k++] = {false, value, uint16_t(byte), 1};
+                slices[k++] = {false, argument, uint16_t(byte), 1};
             }
         }
     } else {
-        for (size_t k = 0; k < pieces.size(); ++k) {
-            pieces[k] = {false, value, uint16_t(k * kWholePieceBytes<V>), kWholePieceBytes<V>};
+        for (size_t k = 0; k < slices.size(); ++k) {
+            slices[k] = {false, argument, uint16_t(k * kWholeSliceBytes<V>), kWholeSliceBytes<V>};
         }
     }
-    return pieces;
+    return slices;
 }
 template <typename Data, size_t... I>
-constexpr auto record_pieces(std::index_sequence<I...>) {
-    std::array<Piece, (kValuePieces<ValueAt<Data, I>> + ... + 0)> pieces{};
+constexpr auto record_slices(std::index_sequence<I...>) {
+    std::array<Slice, (kArgumentSlices<ArgumentAt<Data, I>> + ... + 0)> slices{};
     [[maybe_unused]] size_t count = 0;
-    [[maybe_unused]] const auto add = [&](const auto& value) {
-        for (const Piece& piece : value) {
-            pieces[count++] = piece;
+    [[maybe_unused]] const auto add = [&](const auto& argument_slices) {
+        for (const Slice& slice : argument_slices) {
+            slices[count++] = slice;
         }
     };
-    (add(value_pieces<ValueAt<Data, I>>(uint16_t(I), kSendsDistances<Data>)), ...);
-    return pieces;
+    (add(argument_slices<ArgumentAt<Data, I>>(uint16_t(I), kSendsDistances<Data>)), ...);
+    return slices;
 }
 template <typename Data>
-inline constexpr auto kPieces = record_pieces<Data>(ValueIndices<Data>{});
+inline constexpr auto kSlices = record_slices<Data>(ArgumentIndices<Data>{});
 
-// Data without distances takes the medium form only, with its values whole, so a struct's payload is its bytes, which
-// the host copies into its own struct as they are. Values go largest alignment first and, within one alignment, those
-// whose bytes end on a multiple of it first, each at a multiple of its alignment up to 4, so none of its pieces
-// straddles a word.
+// Data without distances takes the medium form only, with its arguments whole, so a struct's payload is its bytes,
+// which the host copies into its own struct as they are. Arguments go largest alignment first and, within one
+// alignment, those whose bytes end on a multiple of it first, each at a multiple of its alignment up to 4, so none of
+// its slices straddles a word.
 template <typename Data, size_t... I>
-constexpr std::array<spd::RecordCopy, sizeof...(I)> place_values(std::index_sequence<I...>) {
-    constexpr std::array<uint32_t, sizeof...(I)> alignments{uint32_t(alignof(ValueAt<Data, I>))...};
-    std::array<spd::RecordCopy, sizeof...(I)> placements{
-        spd::RecordCopy{uint16_t(I), 0, 0, uint16_t(kFieldLayout<ValueAt<Data, I>>.sent_bytes)}...};
+constexpr std::array<spd::ArgumentSlice, sizeof...(I)> place_arguments(std::index_sequence<I...>) {
+    constexpr std::array<uint32_t, sizeof...(I)> alignments{uint32_t(alignof(ArgumentAt<Data, I>))...};
+    std::array<spd::ArgumentSlice, sizeof...(I)> placements{
+        spd::ArgumentSlice{uint16_t(I), 0, 0, uint16_t(kFieldLayout<ArgumentAt<Data, I>>.sent_bytes)}...};
     uint32_t end = 0;
     for (uint32_t align = std::max({uint32_t{1}, alignments[I]...}); align != 0; align /= 2) {
         for (const bool ragged : {false, true}) {
-            for (size_t value = 0; value < placements.size(); ++value) {
-                if (alignments[value] == align && (placements[value].bytes % align != 0) == ragged) {
-                    placements[value].to = uint16_t(round_up(end, std::min<uint32_t>(align, 4)));
-                    end = placements[value].to + placements[value].bytes;
+            for (size_t argument = 0; argument < placements.size(); ++argument) {
+                if (alignments[argument] == align && (placements[argument].bytes % align != 0) == ragged) {
+                    placements[argument].to = uint16_t(round_up(end, std::min<uint32_t>(align, 4)));
+                    end = placements[argument].to + placements[argument].bytes;
                 }
             }
         }
@@ -268,32 +268,32 @@ constexpr std::array<spd::RecordCopy, sizeof...(I)> place_values(std::index_sequ
     return placements;
 }
 template <typename Data>
-inline constexpr auto kValuePlacement = place_values<Data>(ValueIndices<Data>{});
+inline constexpr auto kArgumentPlacement = place_arguments<Data>(ArgumentIndices<Data>{});
 
 // The words the record's time takes after word 0, and the bytes each Timestamp's distance takes, in each form.
 constexpr uint32_t time_words(spd::TimeForm form) { return uint32_t(form); }
 constexpr uint32_t distance_bytes(spd::TimeForm form) { return 2u << uint32_t(form); }
 
 template <size_t N>
-struct PlacedForm {
+struct PlacedLayout {
     uint32_t body_words;
-    std::array<spd::RecordCopy, N> copies;
+    std::array<spd::ArgumentSlice, N> slices;
 };
 template <typename Data>
-constexpr PlacedForm<kPieces<Data>.size()> place_form(spd::TimeForm form) {
-    constexpr auto& pieces = kPieces<Data>;
-    PlacedForm<pieces.size()> placed{};
+constexpr PlacedLayout<kSlices<Data>.size()> place_layout(spd::TimeForm form) {
+    constexpr auto& slices = kSlices<Data>;
+    PlacedLayout<slices.size()> placed{};
     uint32_t end = 0;
     if constexpr (!kSendsDistances<Data>) {
-        for (size_t k = 0; k < pieces.size(); ++k) {
-            const uint32_t to = kValuePlacement<Data>[pieces[k].value].to + pieces[k].from;
-            placed.copies[k] = {pieces[k].value, pieces[k].from, uint16_t(to), pieces[k].bytes};
-            end = std::max(end, to + pieces[k].bytes);
+        for (size_t k = 0; k < slices.size(); ++k) {
+            const uint32_t to = kArgumentPlacement<Data>[slices[k].argument].to + slices[k].from;
+            placed.slices[k] = {slices[k].argument, slices[k].from, uint16_t(to), slices[k].bytes};
+            end = std::max(end, to + slices[k].bytes);
         }
     } else {
-        // Each piece first-fits at a multiple of its size up to 4, widest first; a payload byte map with room for the
-        // short form's time and every piece at its widest can't run out.
-        bool taken[4 + 8 * pieces.size()] = {};
+        // Each slice first-fits at a multiple of its size up to 4, widest first; a payload byte map with room for the
+        // short form's time and every slice at its widest can't run out.
+        bool taken[4 + 8 * slices.size()] = {};
         const auto is_free = [&](uint32_t offset, uint32_t bytes) {
             for (uint32_t byte = offset; byte < offset + bytes; ++byte) {
                 if (taken[byte]) {
@@ -309,8 +309,8 @@ constexpr PlacedForm<kPieces<Data>.size()> place_form(spd::TimeForm form) {
             end = 4;
         }
         for (uint32_t align = 4; align != 0; align /= 2) {
-            for (size_t k = 0; k < pieces.size(); ++k) {
-                const uint32_t bytes = pieces[k].is_distance ? distance_bytes(form) : pieces[k].bytes;
+            for (size_t k = 0; k < slices.size(); ++k) {
+                const uint32_t bytes = slices[k].is_distance ? distance_bytes(form) : slices[k].bytes;
                 if (std::min<uint32_t>(bytes, 4) != align) {
                     continue;
                 }
@@ -321,7 +321,7 @@ constexpr PlacedForm<kPieces<Data>.size()> place_form(spd::TimeForm form) {
                 for (uint32_t byte = offset; byte < offset + bytes; ++byte) {
                     taken[byte] = true;
                 }
-                placed.copies[k] = {pieces[k].value, pieces[k].from, uint16_t(offset), uint16_t(bytes)};
+                placed.slices[k] = {slices[k].argument, slices[k].from, uint16_t(offset), uint16_t(bytes)};
                 end = std::max(end, offset + bytes);
             }
         }
@@ -330,7 +330,7 @@ constexpr PlacedForm<kPieces<Data>.size()> place_form(spd::TimeForm form) {
     return placed;
 }
 template <typename Data, spd::TimeForm F>
-inline constexpr auto kForm = place_form<Data>(F);
+inline constexpr auto kLayout = place_layout<Data>(F);
 
 // Each ELF has its own copy of the lane's cursor (internal/profiler/kernel_profiler_streaming.hpp), and the host keeps
 // one per lane. A kernel's launch resets its copy, so only kernels write short records.
@@ -342,45 +342,45 @@ inline constexpr bool kWritesShortRecords = false;
 template <typename Data>
 inline constexpr bool kHasShort =
     kWritesShortRecords && kSendsDistances<Data> &&
-    kForm<Data, spd::TimeForm::Short>.body_words < kForm<Data, spd::TimeForm::Medium>.body_words;
+    kLayout<Data, spd::TimeForm::Short>.body_words < kLayout<Data, spd::TimeForm::Medium>.body_words;
 // The body length in word 0 of a call site's packets: its first form's, shortest first.
 template <typename Data>
 inline constexpr uint32_t kFirstBody =
-    kHasShort<Data> ? kForm<Data, spd::TimeForm::Short>.body_words : kForm<Data, spd::TimeForm::Medium>.body_words;
+    kHasShort<Data> ? kLayout<Data, spd::TimeForm::Short>.body_words : kLayout<Data, spd::TimeForm::Medium>.body_words;
 template <typename Data, spd::TimeForm F>
-inline constexpr uint32_t kPayloadWords = kForm<Data, F>.body_words - time_words(F);
+inline constexpr uint32_t kPayloadWords = kLayout<Data, F>.body_words - time_words(F);
 
-// Each piece's first word among the words its record's pieces take, an 8-byte piece taking two, low word first.
+// Each slice's first word among the words its record's slices take, an 8-byte slice taking two, low word first.
 template <typename Data>
-constexpr auto piece_first_words() {
-    std::array<uint32_t, kPieces<Data>.size() + 1> first{};
-    for (size_t k = 0; k < kPieces<Data>.size(); ++k) {
-        first[k + 1] = first[k] + (kPieces<Data>[k].bytes == 8 ? 2 : 1);
+constexpr auto slice_first_words() {
+    std::array<uint32_t, kSlices<Data>.size() + 1> first{};
+    for (size_t k = 0; k < kSlices<Data>.size(); ++k) {
+        first[k + 1] = first[k] + (kSlices<Data>[k].bytes == 8 ? 2 : 1);
     }
     return first;
 }
 template <typename Data>
-inline constexpr auto kPieceFirstWord = piece_first_words<Data>();
+inline constexpr auto kSliceFirstWord = slice_first_words<Data>();
 // The words a record crosses an out-of-line writer's call in, as arguments in registers: its payload's when it has
-// one form, and otherwise its pieces', since the writer picks the form.
+// one form, and otherwise its slices', since the writer picks the form.
 template <typename Data>
 struct RegisterWords {
     std::array<
         uint32_t,
-        kSendsDistances<Data> ? kPieceFirstWord<Data>.back() : kPayloadWords<Data, spd::TimeForm::Medium>>
+        kSendsDistances<Data> ? kSliceFirstWord<Data>.back() : kPayloadWords<Data, spd::TimeForm::Medium>>
         words;
 };
 
-// A record's payload, as the parts it stores in. A run is kRunWords or more payload words that are one value's
+// A record's payload, as the parts it stores in. A run is kRunWords or more payload words that are one argument's
 // consecutive 4-aligned words as it lies in memory, which copy straight from there. Every other word is built from the
-// pieces that land in it. A shorter run builds its words too: the compiler keeps those in registers, and a copy would
-// need the value in memory.
+// slices that land in it. A shorter run builds its words too: the compiler keeps those in registers, and a copy would
+// need the argument in memory.
 inline constexpr uint32_t kRunWords = 9;
 struct PayloadPart {
     uint16_t first_word = 0;
     uint16_t words = 1;
-    int16_t value = -1;  // the value a run copies from; -1 for a built word
-    uint16_t value_offset = 0;
+    int16_t argument = -1;  // the argument a run copies from; -1 for a built word
+    uint16_t argument_offset = 0;
 };
 template <size_t kWords>
 struct PayloadLayout {
@@ -389,35 +389,35 @@ struct PayloadLayout {
     bool has_run = false;
 };
 
-// Which value and byte offset each payload word of form F copies whole from, or value -1 for a word that must be built:
-// one holding bytes of two values, a Timestamp's distance, or the short form's time.
+// Which argument and byte offset each payload word of form F copies whole from, or argument -1 for a word that must be
+// built: one holding bytes of two arguments, a Timestamp's distance, or the short form's time.
 template <typename Data, spd::TimeForm F, size_t... I>
 constexpr std::array<PayloadPart, kPayloadWords<Data, F>> copyable_words(std::index_sequence<I...>) {
-    constexpr auto& form = kForm<Data, F>;
-    constexpr auto& pieces = kPieces<Data>;
-    constexpr uint32_t sizes[] = {uint32_t(sizeof(ValueAt<Data, I>))...};
-    constexpr uint32_t alignments[] = {uint32_t(alignof(ValueAt<Data, I>))...};
+    constexpr auto& layout = kLayout<Data, F>;
+    constexpr auto& slices = kSlices<Data>;
+    constexpr uint32_t sizes[] = {uint32_t(sizeof(ArgumentAt<Data, I>))...};
+    constexpr uint32_t alignments[] = {uint32_t(alignof(ArgumentAt<Data, I>))...};
     std::array<PayloadPart, kPayloadWords<Data, F>> words{};
     for (uint32_t word = 0; word < words.size(); ++word) {
-        // A copyable word's bytes all come from one value, each at the same distance from its place in the payload.
-        int32_t value = -1, distance = 0;
+        // A copyable word's bytes all come from one argument, each at the same distance from its place in the payload.
+        int32_t argument = -1, distance = 0;
         bool copyable = !(F == spd::TimeForm::Short && word == 0);
         for (uint32_t byte = 4 * word; byte < 4 * word + 4; ++byte) {
-            for (size_t k = 0; k < pieces.size(); ++k) {
-                const spd::RecordCopy copy = form.copies[k];
-                if (copy.to <= byte && byte < copy.to + copy.bytes) {
-                    const int32_t byte_distance = int32_t(copy.from + (byte - copy.to)) - int32_t(byte);
-                    copyable &=
-                        !pieces[k].is_distance && (value < 0 || (value == copy.value && distance == byte_distance));
-                    value = copy.value;
+            for (size_t k = 0; k < slices.size(); ++k) {
+                const spd::ArgumentSlice placed = layout.slices[k];
+                if (placed.to <= byte && byte < placed.to + placed.bytes) {
+                    const int32_t byte_distance = int32_t(placed.from + (byte - placed.to)) - int32_t(byte);
+                    copyable &= !slices[k].is_distance &&
+                                (argument < 0 || (argument == placed.argument && distance == byte_distance));
+                    argument = placed.argument;
                     distance = byte_distance;
                 }
             }
         }
         const int32_t offset = int32_t(4 * word) + distance;
-        if (copyable && value >= 0 && alignments[value] >= 4 && offset >= 0 && offset % 4 == 0 &&
-            uint32_t(offset) + 4 <= sizes[value]) {
-            words[word] = {uint16_t(word), 1, int16_t(value), uint16_t(offset)};
+        if (copyable && argument >= 0 && alignments[argument] >= 4 && offset >= 0 && offset % 4 == 0 &&
+            uint32_t(offset) + 4 <= sizes[argument]) {
+            words[word] = {uint16_t(word), 1, int16_t(argument), uint16_t(offset)};
         } else {
             words[word] = {uint16_t(word), 1};
         }
@@ -426,17 +426,18 @@ constexpr std::array<PayloadPart, kPayloadWords<Data, F>> copyable_words(std::in
 }
 template <typename Data, spd::TimeForm F, bool kCopyRuns>
 constexpr auto payload_layout() {
-    constexpr auto words = copyable_words<Data, F>(ValueIndices<Data>{});
+    constexpr auto words = copyable_words<Data, F>(ArgumentIndices<Data>{});
     PayloadLayout<words.size()> payload;
     for (uint32_t word = 0; word < words.size();) {
         const PayloadPart start = words[word];
         uint32_t end = word + 1;
-        while (start.value >= 0 && end < words.size() && words[end].value == start.value &&
-               words[end].value_offset == start.value_offset + 4 * (end - word)) {
+        while (start.argument >= 0 && end < words.size() && words[end].argument == start.argument &&
+               words[end].argument_offset == start.argument_offset + 4 * (end - word)) {
             ++end;
         }
-        if (kCopyRuns && start.value >= 0 && end - word >= kRunWords) {
-            payload.parts[payload.count++] = {uint16_t(word), uint16_t(end - word), start.value, start.value_offset};
+        if (kCopyRuns && start.argument >= 0 && end - word >= kRunWords) {
+            payload.parts[payload.count++] = {
+                uint16_t(word), uint16_t(end - word), start.argument, start.argument_offset};
             payload.has_run = true;
             word = end;
         } else {
@@ -452,8 +453,8 @@ template <typename Data>
 inline constexpr bool kHasRun = kPayloadLayout<Data, spd::TimeForm::Medium, true>.has_run;
 
 template <typename Data, size_t... I>
-constexpr bool check_values(std::index_sequence<I...>) {
-    return (spd::check_value<ValueAt<Data, I>>() & ... & true);
+constexpr bool check_arguments(std::index_sequence<I...>) {
+    return (spd::check_value<ArgumentAt<Data, I>>() & ... & true);
 }
 // The rules a DevicePublish call's types follow, given its arguments' types as forwarding references deduce them, with
 // the profiler on or off; true when they all hold. Each mistake is one error: a string literal passed as an argument is
@@ -469,7 +470,7 @@ constexpr bool check_call() {
     } else {
         using Data = RecordData<Args...>;
         constexpr bool metadata = spd::check_struct<Metadata>();
-        constexpr bool data = check_values<Data>(ValueIndices<Data>{});
+        constexpr bool data = check_arguments<Data>(ArgumentIndices<Data>{});
         if constexpr (metadata && data) {
             if constexpr (holds<Data>(spd::kStringCode)) {
                 static_assert(
@@ -480,7 +481,7 @@ constexpr bool check_call() {
             } else {
                 constexpr auto kLongest = kSendsDistances<Data> ? spd::TimeForm::Full : spd::TimeForm::Medium;
                 static_assert(
-                    kForm<Data, kLongest>.body_words <= ppfmt::LENGTH_MASK,
+                    kLayout<Data, kLongest>.body_words <= ppfmt::LENGTH_MASK,
                     "this record is over the 504-byte limit (500 with Timestamp fields); split it into several "
                     "records");
             }
@@ -507,7 +508,7 @@ inline constexpr uint64_t kStringHash = [] {
 // A String's text by its hash, for the host to look it up by. A String doesn't point at it, so nothing would keep it
 // but `used`.
 template <typename C, C... cs>
-static const spd::RecordString section_string_entry __attribute__((section(".tt_record_strings"), used)) = {
+static const spd::StringEntry section_string_entry __attribute__((section(".tt_record_strings"), used)) = {
     kStringHash<C, cs...>, section_string<C, cs...>, uint32_t(sizeof...(cs))};
 
 template <typename T>
@@ -656,12 +657,12 @@ static const auto section_samples __attribute__((section(".tt_record_data"), unu
     samples_of<T>(std::make_index_sequence<spd::leaf_type_codes<T>.size()>{});
 
 template <typename V>
-constexpr spd::RecordValue call_site_value() {
+constexpr spd::CallArgument call_site_argument() {
     if constexpr (spd::is_std_array<V>) {
-        spd::RecordValue value = call_site_value<typename V::value_type>();
-        value.count = uint32_t(std::tuple_size_v<V>);
-        value.is_array = 1;
-        return value;
+        spd::CallArgument argument = call_site_argument<typename V::value_type>();
+        argument.count = uint32_t(std::tuple_size_v<V>);
+        argument.is_array = 1;
+        return argument;
     } else if constexpr (spd::is_leaf_type<V>) {
         const char* const name = std::is_enum_v<V> ? section_type_name<V>.data() : nullptr;
         return {.type = name, .field_count = 1, .count = 1, .is_array = 0, .samples = nullptr, .size = sizeof(V)};
@@ -676,48 +677,48 @@ constexpr spd::RecordValue call_site_value() {
     }
 }
 template <typename Data, size_t... I>
-constexpr std::array<spd::RecordValue, sizeof...(I)> value_table(std::index_sequence<I...>) {
-    return {call_site_value<ValueAt<Data, I>>()...};
+constexpr std::array<spd::CallArgument, sizeof...(I)> argument_table(std::index_sequence<I...>) {
+    return {call_site_argument<ArgumentAt<Data, I>>()...};
 }
 template <typename Data>
-static const auto section_values __attribute__((section(".tt_record_data"), unused)) =
-    value_table<Data>(ValueIndices<Data>{});
+static const auto section_arguments __attribute__((section(".tt_record_data"), unused)) =
+    argument_table<Data>(ArgumentIndices<Data>{});
 
-// A form's copies for the host: each value whole for data without distances, whose pieces lie together; each piece
+// A form's slices for the host: each argument whole for data without distances, whose slices lie together; each slice
 // otherwise.
 template <typename Data, spd::TimeForm F>
-static const auto section_form_copies __attribute__((section(".tt_record_data"), unused)) = [] {
+static const auto section_layout_slices __attribute__((section(".tt_record_data"), unused)) = [] {
     if constexpr (kSendsDistances<Data>) {
-        return kForm<Data, F>.copies;
+        return kLayout<Data, F>.slices;
     } else {
-        return kValuePlacement<Data>;
+        return kArgumentPlacement<Data>;
     }
 }();
 template <typename Data, spd::TimeForm F>
-constexpr spd::RecordForm call_site_form() {
+constexpr spd::PacketLayout call_site_layout() {
     return {
         .time_form = F,
-        .body_words = kForm<Data, F>.body_words,
-        .copies = section_form_copies<Data, F>.data(),
-        .copy_count = uint32_t(section_form_copies<Data, F>.size())};
+        .body_words = kLayout<Data, F>.body_words,
+        .slices = section_layout_slices<Data, F>.data(),
+        .slice_count = uint32_t(section_layout_slices<Data, F>.size())};
 }
 // The forms a call site keeps, shortest first.
 template <typename Data>
-constexpr auto form_list() {
+constexpr auto layout_list() {
     constexpr bool kShort = kHasShort<Data>, kFull = kSendsDistances<Data>;
-    std::array<spd::RecordForm, 1 + kShort + kFull> list{};
+    std::array<spd::PacketLayout, 1 + kShort + kFull> list{};
     size_t n = 0;
     if constexpr (kShort) {
-        list[n++] = call_site_form<Data, spd::TimeForm::Short>();
+        list[n++] = call_site_layout<Data, spd::TimeForm::Short>();
     }
-    list[n++] = call_site_form<Data, spd::TimeForm::Medium>();
+    list[n++] = call_site_layout<Data, spd::TimeForm::Medium>();
     if constexpr (kFull) {
-        list[n] = call_site_form<Data, spd::TimeForm::Full>();
+        list[n] = call_site_layout<Data, spd::TimeForm::Full>();
     }
     return list;
 }
 template <typename Data>
-static const auto section_forms __attribute__((section(".tt_record_data"), unused)) = form_list<Data>();
+static const auto section_layouts __attribute__((section(".tt_record_data"), unused)) = layout_list<Data>();
 
 // The data type a call site describes its records as, and which of its fields is their publish time and isn't sent.
 template <typename Data>
@@ -737,7 +738,7 @@ template <auto kLocation, auto kMetadata, typename Data>
 static char call_site_handle __attribute__((section(".tt_record_ids"), unused)) = 0;
 
 template <auto kLocation, auto kMetadata, typename Data>
-static const spd::RecordSiteEntry call_site_entry __attribute__((section(".tt_record_meta"), unused)) = {
+static const spd::CallSiteEntry call_site_entry __attribute__((section(".tt_record_meta"), unused)) = {
     .id = &call_site_handle<kLocation, kMetadata, Data>,
     .metadata_type = section_type_name<decltype(kMetadata)>.data(),
     .file = kLocation.file.hash,
@@ -750,10 +751,10 @@ static const spd::RecordSiteEntry call_site_entry __attribute__((section(".tt_re
     .metadata_field_count = uint32_t(section_codes<decltype(kMetadata)>.size()),
     .data_codes = section_codes<typename Described<Data>::type>.data(),
     .data_field_count = uint32_t(section_codes<typename Described<Data>::type>.size()),
-    .data_values = section_values<typename Described<Data>::type>.data(),
-    .data_value_count = uint32_t(section_values<typename Described<Data>::type>.size()),
-    .data_forms = section_forms<Data>.data(),
-    .data_form_count = uint32_t(section_forms<Data>.size()),
+    .data_arguments = section_arguments<typename Described<Data>::type>.data(),
+    .data_argument_count = uint32_t(section_arguments<typename Described<Data>::type>.size()),
+    .data_layouts = section_layouts<Data>.data(),
+    .data_layout_count = uint32_t(section_layouts<Data>.size()),
     .data_published_field = Described<Data>::kPublishedField,
 };
 }  // namespace kernel_profiler::records
@@ -766,12 +767,12 @@ static const spd::RecordSiteEntry call_site_entry __attribute__((section(".tt_re
 namespace kernel_profiler::records {
 
 // A stall is a zone's medium record, and the smallest room check reserves a zone's longest packet.
-static_assert(kForm<ZoneStart, spd::TimeForm::Medium>.body_words == ppfmt::STALL_BODY_WORDS);
-static_assert(1 + kForm<ZoneStart, spd::TimeForm::Full>.body_words == MIN_RESERVE_WORDS);
+static_assert(kLayout<ZoneStart, spd::TimeForm::Medium>.body_words == ppfmt::STALL_BODY_WORDS);
+static_assert(1 + kLayout<ZoneStart, spd::TimeForm::Full>.body_words == MIN_RESERVE_WORDS);
 
-// Value I of a record where the publishing call holds it: the data struct itself, or the I-th argument.
+// Argument I of a record where the publishing call holds it: the data struct itself, or the I-th argument.
 template <size_t I, typename Source>
-FORCE_INLINE const auto& value_at(const Source& source) {
+FORCE_INLINE const auto& argument_at(const Source& source) {
     if constexpr (spd::is_tuple<Source>) {
         return std::get<I>(source);
     } else {
@@ -779,8 +780,8 @@ FORCE_INLINE const auto& value_at(const Source& source) {
     }
 }
 
-// The record's values where the publishing call holds them: the data struct it passed, or references to its
-// arguments, so each payload word reads its value where it lies rather than from a copy.
+// The record's arguments where the publishing call holds them: the data struct it passed, or references to its
+// arguments, so each payload word reads its argument where it lies rather than from a copy.
 template <typename... Args>
 FORCE_INLINE decltype(auto) record_source(const Args&... args) {
     if constexpr (spd::is_tuple<RecordData<Args...>>) {
@@ -796,31 +797,31 @@ using UintOfSize = std::conditional_t<
     uint8_t,
     std::conditional_t<kBytes == 2, uint16_t, std::conditional_t<kBytes == 4, uint32_t, uint64_t>>>;
 
-// Piece K's bits, from the record's values where the publishing call holds them or from its register words. The load
-// is typed rather than a memcpy through an aligned pointer, so the fields of a value held in registers stay there.
+// Slice K's bits, from the record's arguments where the publishing call holds them or from its register words. The load
+// is typed rather than a memcpy through an aligned pointer, so the fields of an argument held in registers stay there.
 template <typename Data, size_t K, typename Source>
-FORCE_INLINE auto piece_bits(const Source& source) {
-    constexpr Piece piece = kPieces<Data>[K];
-    using Bits = std::conditional_t<piece.bytes == 8, uint64_t, uint32_t>;
+FORCE_INLINE auto slice_bits(const Source& source) {
+    constexpr Slice slice = kSlices<Data>[K];
+    using Bits = std::conditional_t<slice.bytes == 8, uint64_t, uint32_t>;
     if constexpr (std::is_same_v<Source, RegisterWords<Data>>) {
-        constexpr uint32_t first = kPieceFirstWord<Data>[K];
-        if constexpr (piece.bytes == 8) {
+        constexpr uint32_t first = kSliceFirstWord<Data>[K];
+        if constexpr (slice.bytes == 8) {
             return uint64_t{source.words[first + 1]} << 32 | source.words[first];
         } else {
             return Bits{source.words[first]};
         }
     } else {
-        using Load __attribute__((may_alias)) = UintOfSize<piece.bytes>;
-        const auto* bytes = reinterpret_cast<const unsigned char*>(&value_at<piece.value>(source)) + piece.from;
+        using Load __attribute__((may_alias)) = UintOfSize<slice.bytes>;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&argument_at<slice.argument>(source)) + slice.from;
         return Bits{*reinterpret_cast<const Load*>(bytes)};
     }
 }
 
-// Piece K's bits where form F's payload word `word` holds them, or 0 when the piece lies elsewhere. Every caller passes
+// Slice K's bits where form F's payload word `word` holds them, or 0 when the slice lies elsewhere. Every caller passes
 // a constant word, so the tests fold away.
 template <typename Data, spd::TimeForm F, size_t K, typename Bits>
-FORCE_INLINE uint32_t piece_in_word(Bits bits, uint32_t word) {
-    constexpr spd::RecordCopy copy = kForm<Data, F>.copies[K];
+FORCE_INLINE uint32_t slice_in_word(Bits bits, uint32_t word) {
+    constexpr spd::ArgumentSlice copy = kLayout<Data, F>.slices[K];
     if (copy.to / 4u == word) {
         return uint32_t(bits) << (8 * (copy.to % 4));
     }
@@ -869,8 +870,8 @@ struct WordStore {
 };
 
 // The writer of every record: a DevicePublish call's, or a zone's, whose data is its ZoneStart. Source is where it
-// reads the record's values, as record_source gives them or as RegisterWords. Data with Timestamps writes the shortest
-// form they fit; other data is always medium.
+// reads the record's arguments, as record_source gives them or as RegisterWords. Data with Timestamps writes the
+// shortest form they fit; other data is always medium.
 template <typename Data, typename Source>
 struct RecordWriter {
     using Form = spd::TimeForm;
@@ -878,9 +879,9 @@ struct RecordWriter {
     // The longest packet: a full one, or a medium one with the timer's high word ahead of it.
     static constexpr uint32_t kMaxWords = [] {
         if constexpr (kSendsDistances<Data>) {
-            return 1 + kForm<Data, Form::Full>.body_words;
+            return 1 + kLayout<Data, Form::Full>.body_words;
         } else {
-            return 2 + kForm<Data, Form::Medium>.body_words;
+            return 2 + kLayout<Data, Form::Medium>.body_words;
         }
     }();
 
@@ -888,27 +889,27 @@ struct RecordWriter {
     template <typename... Inputs>
     static FORCE_INLINE void write(uint32_t header, uint32_t time_hi, uint32_t time_lo, Inputs... inputs) {
         if constexpr (kFromRegisters) {
-            write_record(header, time_hi, time_lo, Source{{inputs...}}, kPieceIndices);
+            write_record(header, time_hi, time_lo, Source{{inputs...}}, kSliceIndices);
         } else {
-            write_record(header, time_hi, time_lo, *inputs..., kPieceIndices);
+            write_record(header, time_hi, time_lo, *inputs..., kSliceIndices);
         }
     }
 
 private:
-    static constexpr auto kPieceIndices = std::make_index_sequence<kPieces<Data>.size()>{};
+    static constexpr auto kSliceIndices = std::make_index_sequence<kSlices<Data>.size()>{};
     static constexpr bool kFromRegisters = std::is_same_v<Source, RegisterWords<Data>>;
     static constexpr bool kCopyRuns = !kFromRegisters;
 
     template <size_t K>
-    static constexpr bool kIsDistance = kPieces<Data>[K].is_distance;
+    static constexpr bool kIsDistance = kSlices<Data>[K].is_distance;
 
-    // The record being written: where its values are, its time, and each piece's Timestamp bits, which are read before
-    // anything is written because they choose the form (0 for any other piece, which is read as it is stored).
+    // The record being written: where its arguments are, its time, and each slice's Timestamp bits, which are read
+    // before anything is written because they choose the form (0 for any other slice, which is read as it is stored).
     struct OutgoingRecord {
         const Source& source;
         uint32_t time_hi;
         uint32_t time_lo;
-        std::array<uint64_t, kPieces<Data>.size()> stamps;
+        std::array<uint64_t, kSlices<Data>.size()> stamps;
     };
 
     template <size_t... K>
@@ -916,7 +917,7 @@ private:
         uint32_t header, uint32_t time_hi, uint32_t time_lo, const Source& source, std::index_sequence<K...>) {
         const OutgoingRecord record{source, time_hi, time_lo, {timestamp_bits<K>(source)...}};
         if constexpr (kSendsDistances<Data>) {
-            write_shortest_form(header, record, kPieceIndices);
+            write_shortest_form(header, record, kSliceIndices);
         } else {
             write_form<Form::Medium>(header, record);
         }
@@ -924,14 +925,14 @@ private:
     template <size_t K>
     static FORCE_INLINE uint64_t timestamp_bits(const Source& source) {
         if constexpr (kIsDistance<K>) {
-            return piece_bits<Data, K>(source);
+            return slice_bits<Data, K>(source);
         } else {
             return 0;
         }
     }
 
     // A Timestamp's distance back from the record's time, its low word and its high word, which borrows when the
-    // Timestamp is later, as a torn read is; 0 for any other piece.
+    // Timestamp is later, as a torn read is; 0 for any other slice.
     template <size_t K, typename Record>
     static FORCE_INLINE uint32_t distance_lo(const Record& record) {
         if constexpr (kIsDistance<K>) {
@@ -951,13 +952,13 @@ private:
     }
 
     template <Form F, size_t K, typename Record>
-    static FORCE_INLINE auto sent_piece(const Record& record) {
+    static FORCE_INLINE auto sent_slice(const Record& record) {
         if constexpr (kIsDistance<K> && F == Form::Full) {
             return uint64_t{distance_hi<K>(record)} << 32 | distance_lo<K>(record);
         } else if constexpr (kIsDistance<K>) {
             return distance_lo<K>(record);
         } else {
-            return piece_bits<Data, K>(record.source);
+            return slice_bits<Data, K>(record.source);
         }
     }
 
@@ -986,10 +987,10 @@ private:
             }
             return;
         }
-        write_full(header, record.time_hi, record.time_lo, sent_piece<Form::Full, K>(record)...);
+        write_full(header, record.time_hi, record.time_lo, sent_slice<Form::Full, K>(record)...);
     }
 
-    // Out of line, so call sites don't carry the full form's code; its pieces come as values.
+    // Out of line, so call sites don't carry the full form's code; its slices come as values.
     template <typename... Sent>
     static __attribute__((noinline)) void write_full(
         uint32_t header, uint32_t time_hi, uint32_t time_lo, Sent... sent) {
@@ -1004,13 +1005,13 @@ private:
     }
     template <size_t W, size_t... K, typename... Sent>
     static FORCE_INLINE uint32_t full_word(std::index_sequence<K...>, Sent... sent) {
-        return (piece_in_word<Data, Form::Full, K>(sent, W) | ... | 0u);
+        return (slice_in_word<Data, Form::Full, K>(sent, W) | ... | 0u);
     }
 
     // Word 0 is the call site's, with its first form's body length, so another form's adjusts it.
     template <Form F>
     static constexpr uint32_t length_change() {
-        return (kForm<Data, F>.body_words - kFirstBody<Data>) << ppfmt::LENGTH_SHIFT;
+        return (kLayout<Data, F>.body_words - kFirstBody<Data>) << ppfmt::LENGTH_SHIFT;
     }
 
     // A record stores as one block when it fits before the ring's end and is long enough for the check to pay for
@@ -1055,13 +1056,13 @@ private:
     }
     template <Form F, PayloadPart kPart, typename Store, typename Record>
     static FORCE_INLINE void store_part(Store store, uint32_t short_time, const Record& record) {
-        if constexpr (kPart.value < 0) {
-            const uint32_t word = built_word<F, kPart.first_word>(record, kPieceIndices);
+        if constexpr (kPart.argument < 0) {
+            const uint32_t word = built_word<F, kPart.first_word>(record, kSliceIndices);
             store.write_word(kPart.first_word, kPart.first_word == 0 ? word | short_time : word);
         } else {
-            const auto* value = reinterpret_cast<const unsigned char*>(&value_at<kPart.value>(record.source));
+            const auto* argument = reinterpret_cast<const unsigned char*>(&argument_at<kPart.argument>(record.source));
             store.template copy_run<kPart.words>(
-                kPart.first_word, reinterpret_cast<const AliasingWord*>(value + kPart.value_offset));
+                kPart.first_word, reinterpret_cast<const AliasingWord*>(argument + kPart.argument_offset));
         }
     }
 
@@ -1070,7 +1071,7 @@ private:
         if constexpr (kFromRegisters && !kSendsDistances<Data>) {
             return record.source.words[W];
         } else {
-            return (piece_in_word<Data, F, K>(sent_piece<F, K>(record), W) | ... | 0u);
+            return (slice_in_word<Data, F, K>(sent_slice<F, K>(record), W) | ... | 0u);
         }
     }
 };
@@ -1078,17 +1079,17 @@ private:
 template <typename Data, size_t A, typename Source, size_t... K>
 FORCE_INLINE uint32_t register_word(const Source& source, std::index_sequence<K...>) {
     if constexpr (!kSendsDistances<Data>) {
-        return (piece_in_word<Data, spd::TimeForm::Medium, K>(piece_bits<Data, K>(source), A) | ... | 0u);
+        return (slice_in_word<Data, spd::TimeForm::Medium, K>(slice_bits<Data, K>(source), A) | ... | 0u);
     } else {
-        constexpr size_t piece = [] {
+        constexpr size_t slice = [] {
             size_t k = 0;
-            while (kPieceFirstWord<Data>[k + 1] <= A) {
+            while (kSliceFirstWord<Data>[k + 1] <= A) {
                 ++k;
             }
             return k;
         }();
-        const auto bits = piece_bits<Data, piece>(source);
-        if constexpr (A == kPieceFirstWord<Data>[piece]) {
+        const auto bits = slice_bits<Data, slice>(source);
+        if constexpr (A == kSliceFirstWord<Data>[slice]) {
             return uint32_t(bits);
         } else {
             return uint32_t(uint64_t(bits) >> 32);
@@ -1103,9 +1104,9 @@ FORCE_INLINE void publish_record(uint32_t header, const Source& source, std::ind
     if constexpr (kHasRun<Data>) {
         publish_with<RecordWriter<Data, Source>, kImmediately, kNoInline>(header, &source);
     } else {
-        constexpr auto pieces = std::make_index_sequence<kPieces<Data>.size()>{};
+        constexpr auto slices = std::make_index_sequence<kSlices<Data>.size()>{};
         publish_with<RecordWriter<Data, RegisterWords<Data>>, kImmediately, kNoInline>(
-            header, register_word<Data, A>(source, pieces)...);
+            header, register_word<Data, A>(source, slices)...);
     }
 }
 
@@ -1113,17 +1114,17 @@ FORCE_INLINE void publish_record(uint32_t header, const Source& source, std::ind
 // is shared between call sites, so each call site instantiates this one function.
 template <auto kLocation>
 struct CallSite {
-    template <auto kMetadata = spd::NoMetadata{}, auto... Options, typename... Values>
-    static FORCE_INLINE void publish(Values&&... values) {
-        if constexpr (check_call<decltype(kMetadata), Values...>() && check_options<decltype(Options)...>()) {
-            using Data = RecordData<Values...>;
+    template <auto kMetadata = spd::NoMetadata{}, auto... Options, typename... Arguments>
+    static FORCE_INLINE void publish(Arguments&&... arguments) {
+        if constexpr (check_call<decltype(kMetadata), Arguments...>() && check_options<decltype(Options)...>()) {
+            using Data = RecordData<Arguments...>;
             constexpr bool immediately = kHasOption<sp::PublishImmediately, Options...>;
             // Only an inlined profiler has a writer to keep out of line; otherwise every call site shares one.
             constexpr bool no_inline = kHasOption<sp::NoInline, Options...> && kProfilerInlined;
             const uint32_t header = site_header<kMetadata, Data, ppfmt::record_w0(kFirstBody<Data>)>();
             publish_record<immediately, no_inline, Data>(
                 header,
-                record_source(values...),
+                record_source(arguments...),
                 std::make_index_sequence<std::tuple_size_v<decltype(RegisterWords<Data>::words)>>{});
         }
     }
@@ -1160,10 +1161,10 @@ tt::tt_metal::experimental::streaming_profiler::Timestamp::now() {
 namespace kernel_profiler::records {
 template <auto kLocation>
 struct CallSite {
-    template <auto kMetadata = spd::NoMetadata{}, auto... Options, typename... Values>
-    static FORCE_INLINE void publish(Values&&...) {
+    template <auto kMetadata = spd::NoMetadata{}, auto... Options, typename... Arguments>
+    static FORCE_INLINE void publish(Arguments&&...) {
         [[maybe_unused]] constexpr bool checked =
-            check_call<decltype(kMetadata), Values...>() && check_options<decltype(Options)...>();
+            check_call<decltype(kMetadata), Arguments...>() && check_options<decltype(Options)...>();
     }
 };
 }  // namespace kernel_profiler::records

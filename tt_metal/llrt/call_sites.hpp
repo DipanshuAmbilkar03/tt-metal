@@ -9,11 +9,10 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <tt-metalium/experimental/streaming_profiler.hpp>
@@ -26,28 +25,6 @@ class ElfFile;
 
 namespace tt::llrt {
 
-// An image's .tt_record_data section, which holds every string its call sites name, and the section's link address,
-// and the texts of the image's Strings by hash, from its .tt_record_strings.
-struct CallSiteStrings {
-    std::vector<char> text;
-    uint64_t vma = 0;
-    std::unordered_map<uint64_t, std::string_view> by_hash;  // views into `text`
-
-    std::string_view string_at(uint32_t address) const {
-        const uint64_t offset = uint64_t{address} - vma;
-        if (offset >= text.size()) {
-            return {};
-        }
-        const std::string_view rest(text.data() + offset, text.size() - offset);
-        return rest.substr(0, rest.find('\0'));
-    }
-    // The text of the String `hash`, or empty when the image has no such String.
-    std::string_view string_of(uint64_t hash) const {
-        const auto it = by_hash.find(hash);
-        return it != by_hash.end() ? it->second : std::string_view();
-    }
-};
-
 struct FieldBits {
     uint32_t bit = 0, width = 0;
     bool operator==(const FieldBits&) const = default;
@@ -56,32 +33,34 @@ struct FieldBits {
 // Where a field lies, from a sample that sets only its bits: the run from the lowest set bit to the highest.
 FieldBits find_set_bits(std::span<const std::byte> sample);
 
+// A call site as its image describes it, every string in it lasting for the process.
 struct CallSite {
     tt::tt_metal::experimental::streaming_profiler::SourceLocation location;
     std::string_view metadata_type;
     std::vector<uint16_t> data_codes, metadata_codes;
     std::vector<FieldBits> metadata_bits;  // each metadata field's bits in the metadata struct
-    // A value the call passes, struct data being one.
-    struct Value {
-        std::string_view type;  // empty for a plain value
+    // An argument the call passes, struct data being one.
+    struct Argument {
+        std::string_view type;  // empty for a plain argument
         uint32_t first_field = 0;
         bool is_array = false;
         std::vector<FieldBits> field_bits;  // where its fields lie in it, in one element for an array
     };
-    std::vector<Value> values;
-    std::vector<uint32_t> value_fields;
-    // A form its records take, which their body length tells apart.
-    struct Form {
+    std::vector<Argument> arguments;
+    std::vector<uint32_t> argument_field_counts;  // each argument's data field count, every element's for an array
+    // The packet layout of a form its records take, which their body length tells apart.
+    struct PacketLayout {
         tt::tt_metal::experimental::streaming_profiler::detail::TimeForm time_form{};
         uint32_t body_words = 0;
         std::vector<FieldBits> data_bits;  // each data field's bits in the payload, width 0 if it holds none
     };
-    std::vector<Form> forms;
+    std::vector<PacketLayout> packet_layouts;
     bool timestamps_as_distances = false;  // whether its Timestamp fields travel back from the record's time
     // The data field that is the record's own time, which no form sends.
     uint32_t published_field = tt::tt_metal::experimental::streaming_profiler::detail::kNoPublishedField;
-    std::vector<std::byte> metadata;  // the metadata struct, as the device compiler laid it out
-    std::shared_ptr<const CallSiteStrings> strings;
+    // The metadata's fields as the call site sets them: each one's bits, sign-extended for a signed field, or a
+    // String's text.
+    std::vector<std::variant<uint64_t, std::string_view>> metadata;
 };
 
 // Gives the image at `elf_path` its block of call-site ids, rebases `elf` there and reads its call sites. Does nothing

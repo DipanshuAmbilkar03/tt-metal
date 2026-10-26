@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <tt_stl/assert.hpp>
@@ -35,7 +36,6 @@ namespace tt::tt_metal::streaming_profiler {
 namespace {
 
 using api::detail::code_bytes;
-using api::detail::kStringCode;
 using api::detail::kTimestampCode;
 constexpr uint16_t kBoolCode = api::detail::type_code<bool>();
 
@@ -45,8 +45,8 @@ constexpr uint32_t host_bytes(uint16_t code) {
 }
 
 // How a Timestamp field's ticks come from what its record sent.
-DirectForm::Op timestamp_op(const tt::llrt::CallSite& site, uint32_t field) {
-    using Op = DirectForm::Op;
+PayloadToRecord::Op timestamp_op(const tt::llrt::CallSite& site, uint32_t field) {
+    using Op = PayloadToRecord::Op;
     return field == site.published_field ? Op::Published : site.timestamps_as_distances ? Op::Distance : Op::Time;
 }
 
@@ -73,7 +73,7 @@ public:
         std::span<const uint8_t> alternatives = {},
         std::pmr::memory_resource* arena = nullptr,
         const RecordTimes* times = nullptr) :
-        FieldReader(alternatives, site.value_fields, arena),
+        FieldReader(alternatives, site.argument_field_counts, arena),
         site_(&site),
         times_(times),
         bytes_(bytes),
@@ -85,10 +85,8 @@ private:
         const size_t field = field_++;
         const uint16_t code = codes_[field];
         const uint64_t value = field_value(bytes_.data(), bits_[field].bit, bits_[field].width, code);
-        if (code == kStringCode) {
-            *static_cast<std::string_view*>(out) = site_->strings->string_of(value);
-        } else if (code == kTimestampCode) {
-            const DirectForm::Op op = timestamp_op(*site_, field);
+        if (code == kTimestampCode) {
+            const PayloadToRecord::Op op = timestamp_op(*site_, field);
             *static_cast<api::Timestamp*>(out) = times_->timestamp(timestamp_ticks(op, times_->published_ticks, value));
         } else {
             std::memcpy(out, &value, code_bytes(code));
@@ -103,15 +101,36 @@ private:
     std::size_t field_ = 0;
 };
 
+// A call site's metadata, from the values its image held.
+class MetadataFields final : public api::detail::FieldReader {
+public:
+    explicit MetadataFields(const tt::llrt::CallSite& site) : site_(&site) {}
+
+private:
+    void read(void* out) override {
+        const size_t field = field_++;
+        const auto& value = site_->metadata[field];
+        if (const auto* text = std::get_if<std::string_view>(&value)) {
+            *static_cast<std::string_view*>(out) = *text;
+        } else {
+            std::memcpy(out, &std::get<uint64_t>(value), code_bytes(site_->metadata_codes[field]));
+        }
+    }
+
+    const tt::llrt::CallSite* site_ = nullptr;
+    std::size_t field_ = 0;
+};
+
 std::optional<std::vector<uint8_t>> value_alternatives(
     const tt::llrt::CallSite& site, std::span<const api::detail::ValueType> types) {
     std::vector<uint8_t> alternatives;
-    for (std::size_t k = 0; k < site.values.size(); k++) {
-        const tt::llrt::CallSite::Value& value = site.values[k];
-        const auto codes = std::span(site.data_codes).subspan(value.first_field, value.field_bits.size());
+    for (std::size_t k = 0; k < site.arguments.size(); k++) {
+        const tt::llrt::CallSite::Argument& argument = site.arguments[k];
+        const auto codes = std::span(site.data_codes).subspan(argument.first_field, argument.field_bits.size());
         const auto fits = [&](const api::detail::ValueType& type) {
-            return type.name == value.type && type.array == value.is_array && std::ranges::equal(type.codes, codes) &&
-                   (type.count == 0 || type.count * value.field_bits.size() == site.value_fields[k]);
+            return type.name == argument.type && type.array == argument.is_array &&
+                   std::ranges::equal(type.codes, codes) &&
+                   (type.count == 0 || type.count * argument.field_bits.size() == site.argument_field_counts[k]);
         };
         // An array of the exact length beats a span, as an exact match beats a conversion when a std::variant is built.
         auto chosen = std::ranges::find_if(
@@ -127,19 +146,19 @@ std::optional<std::vector<uint8_t>> value_alternatives(
     return alternatives;
 }
 
-// The alternative each of a call site's values takes in `kind`, when the site sends records of that kind. A named type
-// is matched by its name alone: one whose fields differ between the two sides has already stopped the program
+// The alternative each of a call site's arguments takes in `kind`, when the site sends records of that kind. A named
+// type is matched by its name alone: one whose fields differ between the two sides has already stopped the program
 // (tt::llrt::add_host_type).
 std::optional<std::vector<uint8_t>> match(const tt::llrt::CallSite& site, const api::detail::Kind& kind) {
     if (site.metadata_type != kind.metadata_type) {
         return std::nullopt;
     }
     if (!kind.value_types.empty()) {
-        return site.values.empty() ? std::nullopt : value_alternatives(site, kind.value_types);
+        return site.arguments.empty() ? std::nullopt : value_alternatives(site, kind.value_types);
     }
-    const bool payload_matches = kind.data_type.empty() ? site.values.empty()
-                                                        : site.values.size() == 1 && !site.values[0].is_array &&
-                                                              site.values[0].type == kind.data_type;
+    const bool payload_matches = kind.data_type.empty() ? site.arguments.empty()
+                                                        : site.arguments.size() == 1 && !site.arguments[0].is_array &&
+                                                              site.arguments[0].type == kind.data_type;
     return payload_matches ? std::optional(std::vector<uint8_t>()) : std::nullopt;
 }
 
@@ -198,24 +217,24 @@ std::optional<std::vector<uint32_t>> direct_offsets(const api::detail::Kind& kin
     return offsets;
 }
 
-DirectForm direct_form(
+PayloadToRecord payload_to_record(
     const tt::llrt::CallSite& site, std::span<const tt::llrt::FieldBits> bits, std::span<const uint32_t> offsets) {
-    using Op = DirectForm::Op;
-    DirectForm form;
+    using Op = PayloadToRecord::Op;
+    PayloadToRecord result;
     for (uint32_t field = 0; field < site.data_codes.size(); field++) {
         const uint16_t code = site.data_codes[field];
         const Op op = code == kTimestampCode ? timestamp_op(site, field) : Op::Copy;
-        form.fields.push_back({op, code, offsets[field], bits[field].bit, bits[field].width});
+        result.fields.push_back({op, code, offsets[field], bits[field].bit, bits[field].width});
         if (op == Op::Distance || op == Op::Published) {
-            form.follows_time.push_back(offsets[field]);
+            result.follows_time.push_back(offsets[field]);
         }
     }
-    return form;
+    return result;
 }
 
 // The layout spsc_short_records() writes a short form's records in, or none when the form's fields don't fit it.
 // The payload is a distance, or the bytes of fields that share one qword of the record.
-std::optional<profiler::SpscShortLayout> short_run_layout(const DirectForm& form, uint32_t stride) {
+std::optional<profiler::SpscShortLayout> short_run_layout(const PayloadToRecord& payload_to_record, uint32_t stride) {
     using Layout = profiler::SpscShortLayout;
     Layout layout{.stride = stride};
     layout.payload_shuffle.fill(Layout::kZeroByte);
@@ -227,9 +246,9 @@ std::optional<profiler::SpscShortLayout> short_run_layout(const DirectForm& form
         filled_qwords |= 1u << qword;
     };
     const auto qword_of = [](uint32_t byte) { return (byte - profiler::kSpscHeadBytes) / 8; };
-    for (const DirectForm::Field& field : form.fields) {
+    for (const PayloadToRecord::Field& field : payload_to_record.fields) {
         const uint32_t qword = qword_of(field.to);
-        if (field.op == DirectForm::Op::Copy) {
+        if (field.op == PayloadToRecord::Op::Copy) {
             const uint32_t bytes = code_bytes(field.code);
             if (layout.distance_mask != 0 || qword_of(field.to + bytes - 1) != qword ||
                 copied_qword.value_or(qword) != qword) {
@@ -244,7 +263,7 @@ std::optional<profiler::SpscShortLayout> short_run_layout(const DirectForm& form
                         uint8_t(8 * (record % 2) + Layout::kPayloadByte + field.bit / 8 + k);
                 }
             }
-        } else if (field.op == DirectForm::Op::Distance) {
+        } else if (field.op == PayloadToRecord::Op::Distance) {
             if (copied_qword) {
                 return std::nullopt;
             }
@@ -293,15 +312,16 @@ RecordRoutes::Route RecordRoutes::resolve(uint32_t id) {
                 alternatives_.emplace(alternatives_key(id, type), std::move(*alternatives));
             }
         }
-        for (const tt::llrt::CallSite::Form& form : site->forms) {
-            if (form.time_form == api::detail::TimeForm::Short) {
-                resolved.short_length = uint8_t(form.body_words);
-            } else if (form.time_form == api::detail::TimeForm::Full) {
-                resolved.full_length = uint8_t(form.body_words);
+        for (const tt::llrt::CallSite::PacketLayout& layout : site->packet_layouts) {
+            if (layout.time_form == api::detail::TimeForm::Short) {
+                resolved.short_length = uint8_t(layout.body_words);
+            } else if (layout.time_form == api::detail::TimeForm::Full) {
+                resolved.full_length = uint8_t(layout.body_words);
             }
         }
         if ((resolved.types & direct_types_) != 0) {
-            resolved.forms = direct_forms(*site, field_offsets_[std::countr_zero(resolved.types & direct_types_)]);
+            resolved.payload_to_record =
+                payload_to_record_by_time_form(*site, field_offsets_[std::countr_zero(resolved.types & direct_types_)]);
         }
     }
     set_route(id, resolved);
@@ -314,31 +334,34 @@ uint64_t RecordRoutes::short_run_type(const Route& route) {
         strides_[type] > profiler::SpscShortLayout::kMaxStride) {
         return 0;
     }
-    const DirectForm& form = (*route.forms)[uint32_t(api::detail::TimeForm::Short)];
-    const std::optional<profiler::SpscShortLayout> layout = short_run_layout(form, strides_[type]);
+    const PayloadToRecord& payload_to_record = (*route.payload_to_record)[uint32_t(api::detail::TimeForm::Short)];
+    const std::optional<profiler::SpscShortLayout> layout = short_run_layout(payload_to_record, strides_[type]);
     if (!layout) {
         return 0;
     }
     if (!short_runs_[type]) {
-        short_runs_[type] = {.layout = *layout, .form = &form};
+        short_runs_[type] = {.layout = *layout, .payload_to_record = &payload_to_record};
     }
     return uint64_t{1} << type;
 }
 
-const DirectForms* RecordRoutes::direct_forms(const tt::llrt::CallSite& site, std::span<const uint32_t> field_offsets) {
-    DirectForms forms;
-    for (const tt::llrt::CallSite::Form& form : site.forms) {
-        forms[uint32_t(form.time_form)] = direct_form(site, form.data_bits, field_offsets);
+const PayloadToRecordByTimeForm* RecordRoutes::payload_to_record_by_time_form(
+    const tt::llrt::CallSite& site, std::span<const uint32_t> field_offsets) {
+    PayloadToRecordByTimeForm by_time_form;
+    for (const tt::llrt::CallSite::PacketLayout& layout : site.packet_layouts) {
+        by_time_form[uint32_t(layout.time_form)] = payload_to_record(site, layout.data_bits, field_offsets);
     }
     // The payload is already the records' data when the site has one form and each field sits in it as in a record,
     // past its head.
     const bool as_is =
-        site.forms.size() == 1 &&
-        std::ranges::all_of(forms[uint32_t(site.forms[0].time_form)].fields, [](const DirectForm::Field& field) {
-            return field.op == DirectForm::Op::Copy && field.bit % 8 == 0 &&
-                   field.width == 8 * code_bytes(field.code) && field.to == profiler::kSpscHeadBytes + field.bit / 8;
-        });
-    return as_is ? nullptr : &forms_.emplace_back(std::move(forms));
+        site.packet_layouts.size() == 1 &&
+        std::ranges::all_of(
+            by_time_form[uint32_t(site.packet_layouts[0].time_form)].fields, [](const PayloadToRecord::Field& field) {
+                return field.op == PayloadToRecord::Op::Copy && field.bit % 8 == 0 &&
+                       field.width == 8 * code_bytes(field.code) &&
+                       field.to == profiler::kSpscHeadBytes + field.bit / 8;
+            });
+    return as_is ? nullptr : &payload_to_record_by_time_form_.emplace_back(std::move(by_time_form));
 }
 
 std::span<const uint8_t> RecordRoutes::alternatives(uint32_t id, uint32_t type) const {
@@ -359,13 +382,13 @@ const std::byte* build_records(
         const PublishedRecord& record = published[i];
         const tt::llrt::CallSite& site = *tt::llrt::find_call_site(record.source.zone_id);
         const RecordTimes times{map, reader, dev, record.clock_offset, record.ticks};
-        const tt::llrt::CallSite::Form& form =
-            *std::ranges::find(site.forms, record.length, &tt::llrt::CallSite::Form::body_words);
+        const tt::llrt::CallSite::PacketLayout& layout =
+            *std::ranges::find(site.packet_layouts, record.length, &tt::llrt::CallSite::PacketLayout::body_words);
         SiteFields fields(
             site,
             std::span(record.bytes, record.byte_count),
             site.data_codes,
-            form.data_bits,
+            layout.data_bits,
             routes.alternatives(record.source.zone_id, type),
             &arena,
             &times);
@@ -430,7 +453,7 @@ const void* detail::build_site_metadata(uint32_t id, const void* (*build)(FieldR
     const void* metadata = site_metadata[id].load(std::memory_order_relaxed);
     if (metadata == nullptr) {
         const tt::llrt::CallSite& site = *tt::llrt::find_call_site(id);
-        internal::SiteFields fields(site, site.metadata, site.metadata_codes, site.metadata_bits);
+        internal::MetadataFields fields(site);
         metadata = build(fields);
         site_metadata[id].store(metadata, std::memory_order_release);
     }

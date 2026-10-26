@@ -143,17 +143,17 @@ public:
         return value;
     }
 
-    // A record's values: each one's alternative and field count, and the arena their arrays go in.
+    // A record's arguments: each one's alternative and field count, and the arena their arrays go in.
     const std::span<const uint8_t> alternatives;
-    const std::span<const uint32_t> value_fields;
+    const std::span<const uint32_t> argument_field_counts;
     std::pmr::memory_resource* const arena;
 
 protected:
     explicit FieldReader(
         std::span<const uint8_t> alternatives = {},
-        std::span<const uint32_t> value_fields = {},
+        std::span<const uint32_t> argument_field_counts = {},
         std::pmr::memory_resource* arena = nullptr) :
-        alternatives(alternatives), value_fields(value_fields), arena(arena) {}
+        alternatives(alternatives), argument_field_counts(argument_field_counts), arena(arena) {}
     virtual void read(void* out) = 0;
 };
 
@@ -181,7 +181,7 @@ public:
     explicit RecordArguments(FieldReader& data) {
         V* values = std::pmr::polymorphic_allocator<V>(data.arena).allocate(data.alternatives.size());
         for (std::size_t k = 0; k < data.alternatives.size(); k++) {
-            std::construct_at(values + k, build_value(data, data.alternatives[k], data.value_fields[k]));
+            std::construct_at(values + k, build_value(data, data.alternatives[k], data.argument_field_counts[k]));
         }
         values_ = {values, data.alternatives.size()};
     }
