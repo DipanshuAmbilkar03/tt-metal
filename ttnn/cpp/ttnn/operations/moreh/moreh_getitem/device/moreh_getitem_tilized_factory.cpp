@@ -11,6 +11,7 @@
 
 #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+#include <tt-metalium/hal.hpp>
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/math.hpp>
 
@@ -153,7 +154,9 @@ ttnn::device_operation::ProgramArtifacts MorehGetItemOperation::MorehGetItemTili
         auto index_cb_data_format = datatype_to_dataformat_converter(index_tensors[0].dtype());
         auto output_cb_data_format = datatype_to_dataformat_converter(output.dtype());
 
-        auto rounded_input_page_size = round_up_to_mul32(input_unit_size);
+        // The reader reads one whole DRAM read granule per element into in0.
+        auto rounded_input_page_size =
+            tt::round_up(round_up_to_mul32(input_unit_size), tt::tt_metal::hal::get_dram_alignment());
         spec.dataflow_buffers.push_back(DataflowBufferSpec{
             .unique_id = IN0,
             .entry_size = rounded_input_page_size,
