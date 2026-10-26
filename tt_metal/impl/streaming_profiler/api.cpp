@@ -86,7 +86,7 @@ private:
         const uint16_t code = codes_[field];
         const uint64_t value = field_value(bytes_.data(), bits_[field].bit, bits_[field].width, code);
         if (code == kStringCode) {
-            *static_cast<std::string_view*>(out) = site_->strings->string_at(uint32_t(value));
+            *static_cast<std::string_view*>(out) = site_->strings->string_of(value);
         } else if (code == kTimestampCode) {
             const DirectForm::Op op = timestamp_op(*site_, field);
             *static_cast<api::Timestamp*>(out) = times_->timestamp(timestamp_ticks(op, times_->published_ticks, value));

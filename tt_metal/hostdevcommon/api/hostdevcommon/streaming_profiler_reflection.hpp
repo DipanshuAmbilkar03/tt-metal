@@ -48,8 +48,8 @@ template <typename E>
 inline constexpr bool is_fixed_enum<E, std::void_t<decltype(E{std::underlying_type_t<E>{}})>> = true;
 
 // A data or metadata field's or a passed value's type as a kind and a width in bits, which both compilers agree on:
-// 'u', 'i' and 'f' for integers and floats, 'c' for plain char, 'b' for bool, 's' for a string in the kernel's ELF (a
-// 32-bit address on the device) and 't' for a Timestamp. An enum is its underlying integer.
+// 'u', 'i' and 'f' for integers and floats, 'c' for plain char, 'b' for bool, 's' for a string in the kernel's ELF (its
+// 64-bit hash on the device) and 't' for a Timestamp. An enum is its underlying integer.
 constexpr uint16_t field_code(char kind, std::size_t bits) { return uint16_t(uint16_t(kind) << 8 | bits); }
 template <typename T>
 constexpr uint16_t type_code() {
@@ -58,7 +58,7 @@ constexpr uint16_t type_code() {
             is_fixed_enum<T>, "enums without a fixed underlying type are not supported; use enum E : uint8_t");
         return type_code<std::underlying_type_t<T>>();
     } else if constexpr (std::is_same_v<T, String>) {
-        return field_code('s', 32);
+        return field_code('s', 64);
     } else if constexpr (std::is_same_v<T, bool>) {
         return field_code('b', 8);
     } else if constexpr (std::is_same_v<T, char>) {

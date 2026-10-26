@@ -16,8 +16,8 @@
 
 namespace tt::tt_metal::experimental::streaming_profiler {
 
-/** @brief A string field or value: written "..."_s in a kernel, and read on the host as a std::string_view that lasts
- * for the process. */
+/** @brief A string field of metadata: written "..."_s in a kernel, and read on the host as a std::string_view that
+ * lasts for the process. */
 #if defined(KERNEL_BUILD) || defined(FW_BUILD)
 struct String {
     String() = default;
@@ -26,7 +26,8 @@ struct String {
     constexpr String(const char (&)[N]) {
         static_assert(N == 0, "strings sent with DevicePublish need an _s suffix: \"text\"_s");
     }
-    const char* text = nullptr;
+    // The 64-bit hash of its text, which "..."_s keeps in the image, where the host looks it up by this hash.
+    uint64_t hash = 0;
 };
 #else
 using String = std::string_view;

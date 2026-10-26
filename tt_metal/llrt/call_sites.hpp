@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <tt-metalium/experimental/streaming_profiler.hpp>
@@ -25,10 +26,12 @@ class ElfFile;
 
 namespace tt::llrt {
 
-// An image's .tt_record_data section, which holds every string its call sites name, and the section's link address.
+// An image's .tt_record_data section, which holds every string its call sites name, and the section's link address,
+// and the texts of the image's Strings by hash, from its .tt_record_strings.
 struct CallSiteStrings {
     std::vector<char> text;
     uint64_t vma = 0;
+    std::unordered_map<uint64_t, std::string_view> by_hash;  // views into `text`
 
     std::string_view string_at(uint32_t address) const {
         const uint64_t offset = uint64_t{address} - vma;
@@ -37,6 +40,11 @@ struct CallSiteStrings {
         }
         const std::string_view rest(text.data() + offset, text.size() - offset);
         return rest.substr(0, rest.find('\0'));
+    }
+    // The text of the String `hash`, or empty when the image has no such String.
+    std::string_view string_of(uint64_t hash) const {
+        const auto it = by_hash.find(hash);
+        return it != by_hash.end() ? it->second : std::string_view();
     }
 };
 

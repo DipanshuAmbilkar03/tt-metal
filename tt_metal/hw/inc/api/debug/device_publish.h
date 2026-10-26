@@ -25,9 +25,9 @@
 // reads a String in metadata as a std::string_view and a Timestamp on its own timeline too; every other field arrives
 // as its own bits.
 //
-// A string is written "..."_s, which copies the literal into a named array in a section the device never loads, where
-// the host reads it; a template argument can point only at such an array. A tool's macro that takes a literal passes it
-// through TT_RECORD_STRING, which adds the _s, so kernel code passes the macro a plain literal.
+// A string is written "..."_s, which keeps the text in a section the device never loads and makes the String the text's
+// 64-bit hash, by which the host looks the text up. A tool's macro that takes a literal passes it through
+// TT_RECORD_STRING, which adds the _s, so kernel code passes the macro a plain literal.
 #pragma once
 
 #include "api/debug/kernel_profiler.hpp"

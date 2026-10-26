@@ -15,13 +15,14 @@ OUTPUT_ARCH(riscv)
 
 #include "dev_mem_map.h"
 
-/* Fake VMAs for the streaming profiler's call-site sections below (internal/debug/device_publish.h). All three are
+/* Fake VMAs for the streaming profiler's call-site sections below (internal/debug/device_publish.h). All four are
    (INFO), so they are non-ALLOC, never appear in a PT_LOAD and are never placed on the device; the host resolves the
    pointers they hold by subtracting the section's own sh_addr (llrt/call_sites.cpp). Each only needs a defined base so
    that the link-time pointers between them are well-formed. They sit at least 1 MB apart and clear of the device memory
    map, continuing the ladder the .device_print_strings sections started at 0x6400000. */
 #define TT_RECORD_DATA_VMA 0x6900000
 #define TT_RECORD_META_VMA 0x6A00000
+#define TT_RECORD_STRINGS_VMA 0x6B00000
 #define TT_RECORD_IDS_VMA 0x6C00000
 
 #if defined(COMPILE_FOR_BRISC)
@@ -172,6 +173,11 @@ SECTIONS
   .tt_record_meta TT_RECORD_META_VMA (INFO) :
   {
     KEEP(*(.tt_record_meta))
+  }
+  /* Each String's hash and its text, which the host looks the String up by. */
+  .tt_record_strings TT_RECORD_STRINGS_VMA (INFO) :
+  {
+    KEEP(*(.tt_record_strings))
   }
   /* One byte per call site, so a site's id is its address and one image's ids are dense from TT_RECORD_IDS_VMA in link
      order. A site materializes its id as lui/addi of its handle plus its packet's type and length, whose type bits

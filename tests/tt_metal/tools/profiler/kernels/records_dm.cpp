@@ -21,27 +21,6 @@ using tt::tt_metal::experimental::streaming_profiler::kPublishImmediately;
 #define EXAMPLE_PRINT(fmt, ...) \
     DevicePublish<Format{TT_RECORD_STRING(fmt), TT_RECORD_STRING(#__VA_ARGS__)}>(__VA_ARGS__)
 
-// The padding canary's pointer-free twin, laid out as the canary is. The language's own reading of its value bits must
-// match the host's copy of the canary's layout (hostdev/record_site.h), which every image's canary is checked against.
-struct PaddingCanaryTwin {
-    uint8_t first;
-    uint32_t text;
-    uint32_t low : 3;
-    uint32_t high : 10;
-    uint8_t last;
-};
-constexpr bool matches_host_canary() {
-    constexpr auto value_bits = kernel_profiler::records::value_bit_mask<PaddingCanaryTwin>();
-    constexpr auto& host = tt::tt_metal::experimental::streaming_profiler::detail::kPaddingCanaryValueBits;
-    for (size_t byte = 0; byte < host.size(); ++byte) {
-        if (value_bits.at[byte] != host[byte]) {
-            return false;
-        }
-    }
-    return sizeof(value_bits) == host.size();
-}
-static_assert(matches_host_canary(), "the padding canary's layout differs from the host's copy");
-
 // A call site in an inlined helper reports the helper, and one in a lambda reports kernel_main()::<lambda()>.
 FORCE_INLINE void publish_from_helper() { DevicePublish<From{"helper"_s}>(); }
 

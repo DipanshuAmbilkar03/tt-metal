@@ -75,15 +75,16 @@ private:
 
 // The stall call site, which kernel_profiler::write_pending_stall() writes without an entry in any ELF: a zone named
 // STALL_ZONE_NAME whose records all take the medium form, its end the record's time and its start a 32-bit distance
-// before its end. Its name is a String at address 0 of its own strings.
+// before its end. Its name is the String with hash 0 of its own strings.
 CallSite make_stall_site() {
-    std::vector<char> name(sp::STALL_ZONE_NAME.begin(), sp::STALL_ZONE_NAME.end());
-    name.push_back('\0');
+    auto strings = std::make_shared<CallSiteStrings>();
+    strings->text.assign(sp::STALL_ZONE_NAME.begin(), sp::STALL_ZONE_NAME.end());
+    strings->by_hash.emplace(0, std::string_view(strings->text.data(), strings->text.size()));
     return {
         .metadata_type = spd::type_name<sp::ZoneMetadata>,
         .data_codes = {spd::kTimestampCode, spd::kTimestampCode},
         .metadata_codes = {spd::kStringCode},
-        .metadata_bits = {{0, 32}},
+        .metadata_bits = {{0, 64}},
         .values = {{.type = spd::type_name<sp::Interval>, .first_field = 0, .field_bits = {{0, 64}, {64, 64}}}},
         .value_fields = {2},
         .forms =
@@ -92,8 +93,8 @@ CallSite make_stall_site() {
               .data_bits = {{0, 32}, {0, 0}}}},
         .timestamps_as_distances = true,
         .published_field = 1,
-        .metadata = std::vector<std::byte>(sizeof(uint32_t)),
-        .strings = std::make_shared<const CallSiteStrings>(CallSiteStrings{.text = std::move(name), .vma = 0})};
+        .metadata = std::vector<std::byte>(sizeof(uint64_t)),
+        .strings = std::move(strings)};
 }
 
 struct Registry {
@@ -130,37 +131,18 @@ struct Section {
     std::span<const std::byte> bytes;
 };
 
-// A String field's sample holds the address of the text kStringSample, in the field's four bytes.
-FieldBits find_string_field(std::span<const std::byte> sample, const CallSiteStrings& strings) {
-    for (size_t byte = 0; byte + sizeof(uint32_t) <= sample.size(); byte++) {
-        uint32_t address = 0;
-        std::memcpy(&address, sample.data() + byte, sizeof(address));
-        if (strings.string_at(address) == spd::kStringSample) {
-            return {uint32_t(8 * byte), 32};
-        }
-    }
-    return {};
-}
-
 // Each field of struct `type`, of `struct_size` bytes, from its samples at `samples_at`, one per field with only that
-// field set. A field fits its type's width, one as wide as its type starts on a byte, and no two fields share a bit. A
-// struct holding a String has one more sample, with only its Strings set, which reads as zero outside them unless its
-// compiler wrote that struct's padding as something other than zeros.
+// field set. A field fits its type's width, one as wide as its type starts on a byte, and no two fields share a bit.
 std::vector<FieldBits> read_field_bits(
     const Section& data,
     uint64_t samples_at,
     uint32_t struct_size,
     std::span<const uint16_t> codes,
-    const CallSiteStrings& strings,
     std::string_view type) {
-    const bool holds_string = std::ranges::find(codes, spd::kStringCode) != codes.end();
-    const std::vector<std::byte> samples =
-        data.read_table<std::byte>(samples_at, uint64_t{struct_size} * (codes.size() + (holds_string ? 1 : 0)));
+    const std::vector<std::byte> samples = data.read_table<std::byte>(samples_at, uint64_t{struct_size} * codes.size());
     std::vector<FieldBits> bits;
     for (size_t field = 0; field < codes.size(); field++) {
-        const auto sample = std::span(samples).subspan(field * struct_size, struct_size);
-        const FieldBits found =
-            codes[field] == spd::kStringCode ? find_string_field(sample, strings) : find_set_bits(sample);
+        const FieldBits found = find_set_bits(std::span(samples).subspan(field * struct_size, struct_size));
         const uint32_t type_bits = 8 * spd::code_bytes(codes[field]);
         TT_FATAL(
             found.width < type_bits || (found.width == type_bits && found.bit % 8 == 0),
@@ -181,41 +163,44 @@ std::vector<FieldBits> read_field_bits(
             type,
             by_bit[k].bit);
     }
-    if (holds_string) {
-        std::vector<bool> in_string(struct_size);
-        for (size_t field = 0; field < codes.size(); field++) {
-            if (codes[field] == spd::kStringCode) {
-                std::fill_n(in_string.begin() + bits[field].bit / 8, sizeof(uint32_t), true);
-            }
-        }
-        const auto strings_only = std::span(samples).subspan(codes.size() * struct_size, struct_size);
-        for (uint32_t byte = 0; byte < struct_size; byte++) {
-            TT_FATAL(
-                in_string[byte] || strings_only[byte] == std::byte{0},
-                "streaming profiler: the device compiler wrote padding that isn't zero in {}: byte {} of its sample "
-                "with only its Strings set is {:#04x}",
-                type,
-                byte,
-                std::to_integer<uint8_t>(strings_only[byte]));
-        }
-    }
     return bits;
 }
 
-// A translation unit's padding canary, which its compiler wrote the way it writes the samples of a struct holding a
-// String. Its padding must read as zero.
-void check_padding_canary(const Section& data, uint64_t address, const std::string& elf_path) {
-    const std::vector<std::byte> canary = data.read_table<std::byte>(address, spd::kPaddingCanaryValueBits.size());
-    for (uint32_t byte = 0; byte < canary.size(); byte++) {
-        const bool in_string = byte - spd::kPaddingCanaryStringAt < sizeof(uint32_t);
+// An image's Strings by hash. Each translation unit has its own entry for a text it uses, so a text repeats; two
+// different texts with one hash fail the load.
+void read_strings(CallSiteStrings& strings, const Section& table, const std::string& elf_path) {
+    for (const spd::RecordString& entry :
+         table.read_table<spd::RecordString>(table.vma, table.bytes.size() / sizeof(spd::RecordString))) {
+        const uint64_t offset = uint64_t{entry.text} - strings.vma;
         TT_FATAL(
-            in_string || std::to_integer<uint8_t>(canary[byte]) == spd::kPaddingCanaryValueBits[byte],
-            "streaming profiler: the device compiler wrote padding that isn't zero in '{}': byte {} of its padding "
-            "canary is {:#04x}, not {:#04x}",
+            offset < strings.text.size() && entry.size < strings.text.size() - offset,
+            "streaming profiler: '{}' has a string outside its .tt_record_data",
+            elf_path);
+        const std::string_view text(strings.text.data() + offset, entry.size);
+        const auto [held, added] = strings.by_hash.try_emplace(entry.hash, text);
+        TT_FATAL(
+            added || held->second == text,
+            "streaming profiler: '{}' has two strings with one hash, \"{}\" and \"{}\"; change either text",
             elf_path,
-            byte,
-            std::to_integer<uint8_t>(canary[byte]),
-            spd::kPaddingCanaryValueBits[byte]);
+            held->second,
+            text);
+    }
+}
+
+// Every String in a call site's metadata has its text in the image.
+void check_metadata_strings(const CallSite& site, const std::string& elf_path) {
+    for (size_t field = 0; field < site.metadata_codes.size(); field++) {
+        if (site.metadata_codes[field] != spd::kStringCode) {
+            continue;
+        }
+        uint64_t hash = 0;
+        std::memcpy(&hash, site.metadata.data() + site.metadata_bits[field].bit / 8, sizeof(hash));
+        TT_FATAL(
+            site.strings->by_hash.contains(hash),
+            "streaming profiler: '{}': {}:{} names a string that isn't in the image's .tt_record_strings",
+            elf_path,
+            site.location.file,
+            site.location.line);
     }
 }
 
@@ -247,8 +232,7 @@ std::vector<ValueField> read_values(CallSite& site, std::span<const spd::RecordV
         const auto codes = std::span(site.data_codes).subspan(first_field, value.field_count);
         std::vector<FieldBits> bits =
             value.samples != 0
-                ? read_field_bits(
-                      data, value.samples, value.size, codes, *site.strings, site.strings->string_at(value.type))
+                ? read_field_bits(data, value.samples, value.size, codes, site.strings->string_at(value.type))
                 : std::vector{FieldBits{0, 8 * spd::code_bytes(codes[0])}};
         for (uint32_t element = 0; element < value.count; element++) {
             for (const FieldBits& field : bits) {
@@ -289,16 +273,21 @@ std::vector<FieldBits> find_payload_bits(
 }
 
 std::vector<std::pair<uint32_t, CallSite>> read_call_sites(const std::string& elf_path, const ll_api::ElfFile& elf) {
-    const Section meta(elf, ".tt_record_meta"), data(elf, ".tt_record_data");
-    const auto strings = std::make_shared<const CallSiteStrings>(
+    const Section meta(elf, ".tt_record_meta"), data(elf, ".tt_record_data"), string_table(elf, ".tt_record_strings");
+    auto image_strings = std::make_shared<CallSiteStrings>(
         CallSiteStrings{.text = data.read_table<char>(data.vma, data.bytes.size()), .vma = data.vma});
+    read_strings(*image_strings, string_table, elf_path);
+    const std::shared_ptr<const CallSiteStrings> strings = std::move(image_strings);
     std::vector<std::pair<uint32_t, CallSite>> sites;
     for (const spd::RecordSiteEntry& entry :
          meta.read_table<spd::RecordSiteEntry>(meta.vma, meta.bytes.size() / sizeof(spd::RecordSiteEntry))) {
-        check_padding_canary(data, entry.padding_canary, elf_path);
+        TT_FATAL(
+            strings->by_hash.contains(entry.file),
+            "streaming profiler: '{}': a call site's file name isn't in the image's .tt_record_strings",
+            elf_path);
         CallSite site{
             .location =
-                {.file = strings->string_at(entry.file),
+                {.file = strings->string_of(entry.file),
                  .function = strings->string_at(entry.function),
                  .line = entry.line},
             .metadata_type = strings->string_at(entry.metadata_type),
@@ -307,8 +296,9 @@ std::vector<std::pair<uint32_t, CallSite>> read_call_sites(const std::string& el
             .published_field = entry.data_published_field,
             .metadata = data.read_table<std::byte>(entry.metadata, entry.metadata_size),
             .strings = strings};
-        site.metadata_bits = read_field_bits(
-            data, entry.metadata_samples, entry.metadata_size, site.metadata_codes, *strings, site.metadata_type);
+        site.metadata_bits =
+            read_field_bits(data, entry.metadata_samples, entry.metadata_size, site.metadata_codes, site.metadata_type);
+        check_metadata_strings(site, elf_path);
         const std::vector<ValueField> fields =
             read_values(site, data.read_table<spd::RecordValue>(entry.data_values, entry.data_value_count), data);
         // Only data whose Timestamps travel as distances has a full form.

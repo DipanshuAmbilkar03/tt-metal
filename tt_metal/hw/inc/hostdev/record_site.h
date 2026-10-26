@@ -62,7 +62,7 @@ struct RecordForm {
 struct RecordSiteEntry {
     SectionAddress<char> id;  // the call site's handle in .tt_record_ids, which the loader rebases into an id
     SectionAddress<char> metadata_type;
-    SectionAddress<char> file;
+    uint64_t file;  // the String of the call site's file name
     uint32_t line;
     SectionAddress<char> function;
     SectionAddress<void> metadata;
@@ -77,32 +77,30 @@ struct RecordSiteEntry {
     SectionAddress<RecordForm> data_forms;  // one per form its records take, shortest first
     uint32_t data_form_count;
     uint32_t data_published_field;  // the data field that is the record's publish time and isn't sent
-    SectionAddress<void> padding_canary;
 };
 
 // A RecordSiteEntry's data_published_field when no field is the record's publish time.
 inline constexpr uint32_t kNoPublishedField = ~0u;
+
+// An entry of an image's .tt_record_strings: a String's hash and its text, `size` bytes before the NUL that ends it.
+// Every translation unit that uses a text has an entry of its own for it.
+struct RecordString {
+    uint64_t hash;
+    SectionAddress<char> text;
+    uint32_t size;
+};
 
 // Both compilers lay these tables out alike.
 static_assert(sizeof(RecordCopy) == 4 * sizeof(uint16_t));
 static_assert(sizeof(RecordValue) == 6 * sizeof(uint32_t));
 static_assert(sizeof(RecordForm) == 4 * sizeof(uint32_t));
 static_assert(sizeof(RecordSiteEntry) == 18 * sizeof(uint32_t));
+static_assert(sizeof(RecordString) == 4 * sizeof(uint32_t));
 
 // A value's size on the device, which is also its alignment.
 constexpr uint32_t code_bytes(uint16_t code) { return (code & 0xff) / 8; }
 
 inline constexpr uint16_t kStringCode = type_code<String>();
 inline constexpr uint16_t kTimestampCode = type_code<Timestamp>();
-
-// The text a String field's sample holds, which the host finds the field by.
-inline constexpr char kStringSample[] = "tt-record-string-sample";
-
-// The device's padding canary (internal/debug/device_publish.h) as RV32 lays it out: a uint8_t, its padding, a String's
-// four bytes, 3 and 10 bits of bit-fields that leave three bits of their second byte as padding, a uint8_t and the tail
-// padding. With its fields all ones, its bytes are these value bits, the String's bytes holding an address.
-inline constexpr std::array<uint8_t, 12> kPaddingCanaryValueBits = {
-    0xFF, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0xFF, 0};
-inline constexpr uint32_t kPaddingCanaryStringAt = 4;
 
 }  // namespace tt::tt_metal::experimental::streaming_profiler::detail

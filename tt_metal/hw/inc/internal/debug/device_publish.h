@@ -497,14 +497,18 @@ constexpr bool check_call() {
 template <typename C, C... cs>
 static constexpr C section_string[] __attribute__((section(".tt_record_data"), unused)) = {cs..., C(0)};
 
-template <const char* P, size_t... I>
-constexpr const char* section_copy(std::index_sequence<I...>) {
-    return section_string<char, P[I]...>;
-}
-template <const char* P>
-constexpr const char* section_copy() {
-    return section_copy<P>(std::make_index_sequence<__builtin_strlen(P)>{});
-}
+// A text's 64-bit FNV-1a hash, which a String holds.
+template <typename C, C... cs>
+inline constexpr uint64_t kStringHash = [] {
+    uint64_t hash = 0xcbf29ce484222325;
+    ((hash = (hash ^ uint8_t(cs)) * 0x100000001b3), ...);
+    return hash;
+}();
+// A String's text by its hash, for the host to look it up by. A String doesn't point at it, so nothing would keep it
+// but `used`.
+template <typename C, C... cs>
+static const spd::RecordString section_string_entry __attribute__((section(".tt_record_strings"), used)) = {
+    kStringHash<C, cs...>, section_string<C, cs...>, uint32_t(sizeof...(cs))};
 
 template <typename T>
 static const auto section_type_name __attribute__((section(".tt_record_data"), unused)) = spd::kTypeNameChars<T>;
@@ -538,29 +542,21 @@ static const auto section_metadata __attribute__((section(".tt_record_data"), un
 template <typename T>
 static const auto section_codes __attribute__((section(".tt_record_data"), unused)) = spd::leaf_type_codes<T>;
 
-// A struct's samples, one per field: the struct with that field's bits set and every other field zero. A String field
-// can't have every bit set, so its sample holds the text kStringSample instead, which the host finds it by.
+// A struct's samples, one per field: the struct with that field's bits set and every other field zero.
 inline constexpr size_t kEveryField = ~size_t{0};
-inline constexpr size_t kStringFields = kEveryField - 1;
 struct SampleSource {
-    size_t field_to_set = 0;  // or kEveryField, or kStringFields
-    const char* string_sample = nullptr;
+    size_t field_to_set = 0;  // or kEveryField
     size_t next_field = 0;
     constexpr void open() {}
     constexpr void close() {}
     // A float's or a double's smallest negative value sets its lowest and highest bits, a bool's true its only one.
     template <typename V>
     constexpr V leaf() {
-        const bool set = next_field++ == field_to_set || field_to_set == kEveryField ||
-                         (field_to_set == kStringFields && std::is_same_v<V, sp::String>);
+        const bool set = next_field++ == field_to_set || field_to_set == kEveryField;
         if (!set) {
             return V{};
         }
-        if constexpr (std::is_same_v<V, sp::String>) {
-            sp::String string;
-            string.text = string_sample;
-            return string;
-        } else if constexpr (std::is_same_v<V, sp::Timestamp>) {
+        if constexpr (std::is_same_v<V, sp::String> || std::is_same_v<V, sp::Timestamp>) {
             return __builtin_bit_cast(V, ~uint64_t{0});
         } else if constexpr (std::is_same_v<V, bool>) {
             return true;
@@ -575,7 +571,7 @@ struct SampleSource {
 };
 template <typename T>
 constexpr T sample_of(size_t field) {
-    SampleSource source{field, section_copy<spd::kStringSample>()};
+    SampleSource source{field};
     return spd::build<T>(source);
 }
 
@@ -636,14 +632,10 @@ constexpr Bytes<sizeof(T)> value_bit_mask() {
 // T's samples, each its representation as the language defines it: each value bit as the sample sets it and every
 // padding bit zero, which nothing about how the compiler writes padding can change. An empty type has no samples, and
 // one with unique object representations has no padding bits (the language says so), so its samples as written are
-// exactly its value bits. A String is an address, and the language shows no type holding a pointer as bytes at compile
-// time, so a struct holding one keeps its samples as written, plus one more with only its Strings set. Every other bit
-// of that last sample is padding or a zero field, so the host requires it to read as zero.
+// exactly its value bits.
 template <typename T, size_t... K>
 constexpr auto samples_of(std::index_sequence<K...>) {
-    if constexpr (holds<T>(spd::kStringCode)) {
-        return std::array<T, sizeof...(K) + 1>{sample_of<T>(K)..., sample_of<T>(kStringFields)};
-    } else if constexpr (std::is_empty_v<T> || std::has_unique_object_representations_v<T>) {
+    if constexpr (std::is_empty_v<T> || std::has_unique_object_representations_v<T>) {
         return std::array<T, sizeof...(K)>{sample_of<T>(K)...};
     } else {
         const Bytes<sizeof(T)> mask = value_bit_mask<T>();
@@ -662,25 +654,6 @@ constexpr auto samples_of(std::index_sequence<K...>) {
 template <typename T>
 static const auto section_samples __attribute__((section(".tt_record_data"), unused)) =
     samples_of<T>(std::make_index_sequence<spd::leaf_type_codes<T>.size()>{});
-
-// A struct with a String, bit-fields and each kind of padding, its fields all ones, written the way the samples of a
-// struct holding a String are. The loader requires its padding to read as zero (hostdev/record_site.h).
-struct PaddingCanary {
-    uint8_t first;
-    sp::String text;
-    uint32_t low : 3;
-    uint32_t high : 10;
-    uint8_t last;
-};
-static_assert(sizeof(PaddingCanary) == spd::kPaddingCanaryValueBits.size());
-constexpr sp::String string_sample() {
-    sp::String string;
-    string.text = section_copy<spd::kStringSample>();
-    return string;
-}
-template <typename = void>
-static const PaddingCanary section_padding_canary
-    __attribute__((section(".tt_record_data"), unused)) = {0xFF, string_sample(), 0x7, 0x3FF, 0xFF};
 
 template <typename V>
 constexpr spd::RecordValue call_site_value() {
@@ -767,7 +740,7 @@ template <auto kLocation, auto kMetadata, typename Data>
 static const spd::RecordSiteEntry call_site_entry __attribute__((section(".tt_record_meta"), unused)) = {
     .id = &call_site_handle<kLocation, kMetadata, Data>,
     .metadata_type = section_type_name<decltype(kMetadata)>.data(),
-    .file = kLocation.file.text,
+    .file = kLocation.file.hash,
     .line = kLocation.line,
     .function = section_function_name<kLocation>(std::make_index_sequence<sizeof(kLocation.function) - 1>{}),
     .metadata = &section_metadata<kMetadata>,
@@ -782,7 +755,6 @@ static const spd::RecordSiteEntry call_site_entry __attribute__((section(".tt_re
     .data_forms = section_forms<Data>.data(),
     .data_form_count = uint32_t(section_forms<Data>.size()),
     .data_published_field = Described<Data>::kPublishedField,
-    .padding_canary = &section_padding_canary<>,
 };
 }  // namespace kernel_profiler::records
 
@@ -1204,11 +1176,13 @@ tt::tt_metal::experimental::streaming_profiler::Timestamp::now() {
 
 #endif
 
-// Usable as a template argument (a string literal is not) and as a pack value, where only its address travels.
+// Usable as a template argument (a string literal is not). The String is its text's hash, and taking the text's entry
+// keeps the text in the image, where the host looks it up by that hash.
 template <typename C, C... cs>
 constexpr tt::tt_metal::experimental::streaming_profiler::String operator""_s() {
+    [[maybe_unused]] const auto* const entry = &kernel_profiler::records::section_string_entry<C, cs...>;
     tt::tt_metal::experimental::streaming_profiler::String string;
-    string.text = kernel_profiler::records::section_string<C, cs...>;
+    string.hash = kernel_profiler::records::kStringHash<C, cs...>;
     return string;
 }
 
