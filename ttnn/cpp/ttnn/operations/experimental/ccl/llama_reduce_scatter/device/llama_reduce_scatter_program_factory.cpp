@@ -1045,11 +1045,10 @@ void LlamaReduceScatterDeviceOperation::LlamaReduceScatterAdd::override_runtime_
     (void)sender_core_grid;
     const auto cores = corerange_to_cores(all_cores_grid, std::nullopt, row_major);
 
-    TT_FATAL(tensor_args.input_tensor.buffer() != nullptr, "llama_reduce_scatter input tensor must have a buffer");
-    TT_FATAL(tensor_return_value.buffer() != nullptr, "llama_reduce_scatter output tensor must have a buffer");
+    TT_FATAL(tensor_args.input_tensor.is_allocated(), "llama_reduce_scatter input tensor must have a buffer");
+    TT_FATAL(tensor_return_value.is_allocated(), "llama_reduce_scatter output tensor must have a buffer");
     TT_FATAL(
-        tensor_args.intermediate_packet_buffer.buffer() != nullptr,
-        "llama_reduce_scatter packet buffer must have a buffer");
+        tensor_args.intermediate_packet_buffer.is_allocated(), "llama_reduce_scatter packet buffer must have a buffer");
 
     constexpr uint32_t kExpectedGlobalCbs = 3;
     uint32_t updated_global_cbs = 0;

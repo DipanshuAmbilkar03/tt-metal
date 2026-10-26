@@ -22,13 +22,13 @@ ttnn::Tensor affine_exclusive_scan(
     uint32_t sequence_parallel_axis,
     const std::optional<Tensor>& actual_end) {
     TT_FATAL(
-        a.storage_type() == StorageType::DEVICE && a.buffer() != nullptr,
+        a.storage_type() == StorageType::DEVICE && a.is_allocated(),
         "affine_exclusive_scan: a must be an allocated device tensor");
     TT_FATAL(
-        b.storage_type() == StorageType::DEVICE && b.buffer() != nullptr,
+        b.storage_type() == StorageType::DEVICE && b.is_allocated(),
         "affine_exclusive_scan: b must be an allocated device tensor");
     TT_FATAL(
-        initial_state.storage_type() == StorageType::DEVICE && initial_state.buffer() != nullptr,
+        initial_state.storage_type() == StorageType::DEVICE && initial_state.is_allocated(),
         "affine_exclusive_scan: initial_state must be an allocated device tensor");
     const auto output_memory_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
     const auto kernel_config = init_device_compute_kernel_config(

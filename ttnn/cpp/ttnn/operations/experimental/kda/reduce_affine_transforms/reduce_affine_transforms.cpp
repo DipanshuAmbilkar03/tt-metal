@@ -18,10 +18,10 @@ std::pair<ttnn::Tensor, ttnn::Tensor> reduce_affine_transforms(
     uint32_t sequence_parallel_axis,
     const std::optional<Tensor>& actual_end) {
     TT_FATAL(
-        a.storage_type() == StorageType::DEVICE && a.buffer() != nullptr,
+        a.storage_type() == StorageType::DEVICE && a.is_allocated(),
         "reduce_affine_transforms: a must be an allocated device tensor");
     TT_FATAL(
-        b.storage_type() == StorageType::DEVICE && b.buffer() != nullptr,
+        b.storage_type() == StorageType::DEVICE && b.is_allocated(),
         "reduce_affine_transforms: b must be an allocated device tensor");
     const auto output_memory_config = memory_config.value_or(ttnn::DRAM_MEMORY_CONFIG);
     const auto kernel_config = init_device_compute_kernel_config(
