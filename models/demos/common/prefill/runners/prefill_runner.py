@@ -261,16 +261,18 @@ def _socket_next(h2d_service, sockets, n_mtp: int = 0) -> tuple:
     return tokens, overhang, _decode_metadata(sockets.metadata)
 
 
-# Relay mode: send the D2D traffic between galaxies over the direct cables through relay cores
-# (D2DStreamConfig::relay), instead of one fabric route per chip, and carry the inter-mesh fabric traffic
-# on VC0 (no VC1). The adapter sets the default, so a deployment gets it with no environment variable;
-# PREFILL_D2D_RELAY=0 turns it off.
-D2D_RELAY = os.environ.get("PREFILL_D2D_RELAY", str(int(ADAPTER.d2d_relay_default))) == "1"
-if D2D_RELAY:
-    # The fabric reads this when the mesh opens, so it must be set before open_mesh_device.
+# TT_METAL_FABRIC_INTERMESH_VC0=1 carries the inter-mesh fabric traffic on VC0 (no VC1), and the D2D
+# service then sends the traffic between galaxies over the direct cables through relay cores
+# (D2DStreamConfig::relay). The adapter sets the default, so a deployment gets it with no environment
+# variable; TT_METAL_FABRIC_INTERMESH_VC0=0 turns it off. The fabric reads the variable when the mesh
+# opens, so it must be set before open_mesh_device.
+if ADAPTER.d2d_relay_default:
     os.environ.setdefault("TT_METAL_FABRIC_INTERMESH_VC0", "1")
-elif ADAPTER.d2d_relay_default:
-    logger.warning(f"[prefill] PREFILL_D2D_RELAY=0: {ADAPTER.name} runs without the relay, slower than deployed")
+D2D_RELAY = os.environ.get("TT_METAL_FABRIC_INTERMESH_VC0", "0") == "1"
+if ADAPTER.d2d_relay_default and not D2D_RELAY:
+    logger.warning(
+        f"[prefill] TT_METAL_FABRIC_INTERMESH_VC0=0: {ADAPTER.name} runs without the relay, slower than deployed"
+    )
 
 
 def build_d2d_pipeline_endpoints(
@@ -297,7 +299,6 @@ def build_d2d_pipeline_endpoints(
             metadata_size_bytes=D2D_METADATA_SIZE_BYTES,
             share_fabric_links=True,
             socket_buffer_type=ttnn.BufferType.L1,
-            relay=D2D_RELAY,
         )
 
     inbound = None
@@ -331,7 +332,6 @@ def build_d2d_index_endpoints(mesh_device, rank: int, per_chip_shape, *, inbound
             metadata_size_bytes=METADATA_SIZE_BYTES,
             share_fabric_links=True,
             socket_buffer_type=ttnn.BufferType.L1,
-            relay=D2D_RELAY,
         )
 
     idx_in = None
@@ -833,8 +833,10 @@ def _print_config() -> None:
         ("PREFILL_GATE_FALLBACK_MODE", _gate_mode_name),
         ("PREFILL_FABRIC_MODE", os.environ.get("PREFILL_FABRIC_MODE", "2d_torus_xy")),
         ("PREFILL_PP_D2D_FIFO_BYTES", str(D2D_FIFO_SIZE_BYTES)),
-        ("PREFILL_D2D_RELAY", f"{int(D2D_RELAY)} (adapter.d2d_relay_default={ADAPTER.d2d_relay_default})"),
-        ("TT_METAL_FABRIC_INTERMESH_VC0", os.environ.get("TT_METAL_FABRIC_INTERMESH_VC0", "0")),
+        (
+            "TT_METAL_FABRIC_INTERMESH_VC0",
+            f"{int(D2D_RELAY)} (relay; adapter.d2d_relay_default={ADAPTER.d2d_relay_default})",
+        ),
         ("PREFILL_H2D_SERVICE_ID", os.environ.get("PREFILL_H2D_SERVICE_ID", "ds_prefill")),
         ("PREFILL_TRACE_DIR", os.environ.get("PREFILL_TRACE_DIR", ADAPTER.prefill_trace_default)),
         ("PREFILL_ENABLE_MIGRATION", str(int(migration_publish_enabled()))),

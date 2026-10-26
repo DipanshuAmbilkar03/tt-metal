@@ -175,10 +175,8 @@ if [ -n "${VARIANT}" ]; then
 fi
 PRODUCER_ENV="export PREFILL_PRODUCER_MANIFEST='${MANIFEST}'; ${PRODUCER_ENV}"
 
-# Relay mode for the D2D streams (prefill_runner.py PREFILL_D2D_RELAY). tt-run forwards only
-# RUNNER_ENV, so pass it explicitly, or ranks would disagree on the stream layout.
-[ -n "${PREFILL_D2D_RELAY:-}" ] && RUNNER_ENV+=" export PREFILL_D2D_RELAY=${PREFILL_D2D_RELAY};"
-# Same for the VC0-only fabric switch: both sides of a cable must build the same router shape.
+# The VC0-only fabric switch, which also turns on the D2D relay. tt-run forwards only RUNNER_ENV, so pass it
+# explicitly, or ranks would disagree on the router shape and the stream layout.
 [ -n "${TT_METAL_FABRIC_INTERMESH_VC0:-}" ] && RUNNER_ENV+=" export TT_METAL_FABRIC_INTERMESH_VC0=${TT_METAL_FABRIC_INTERMESH_VC0};"
 # A PP model carries its descriptor in its rank binding, so only the discovery path needs one.
 if [ "${PP_RANKS}" -eq 0 ]; then
