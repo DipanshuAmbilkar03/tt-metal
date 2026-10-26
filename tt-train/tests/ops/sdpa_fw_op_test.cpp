@@ -1725,13 +1725,13 @@ TEST_F(SDPAForwardTest, SDPAForwardTest_ChunkKnobs_DefaultPick) {
     const auto picked = resolve_chunks({}, tinyllama, kBudget, kCores);
     EXPECT_GE(picked.rows(), 4U) << "Sq=" << picked.Sq_chunk_t << " h=" << picked.heads_per_item;
     EXPECT_GE(picked.Sk_chunk_t, 4U);
-    EXPECT_LE(l1_bytes(cb_tiles(tinyllama, picked)), kBudget);
+    EXPECT_LE(l1_bytes(cb_tiles(tinyllama, picked, /* with_partials */ true)), kBudget);
 
     SDPAForwardShape wide = tinyllama;  // head dim 512: the biggest chunks do not fit, the pick must degrade
     wide.qWt = 16U;
     wide.vWt = 16U;
     const auto picked_wide = resolve_chunks({}, wide, kBudget, kCores);
-    EXPECT_LE(l1_bytes(cb_tiles(wide, picked_wide)), kBudget);
+    EXPECT_LE(l1_bytes(cb_tiles(wide, picked_wide, /* with_partials */ true)), kBudget);
 
     // A user knob pins its axis; the others are still picked.
     const auto pinned = resolve_chunks({.k_chunk_size = 32U}, tinyllama, kBudget, kCores);
