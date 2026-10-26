@@ -6,7 +6,12 @@ from helpers.chip_architecture import ChipArchitecture, get_chip_architecture
 from helpers.device import BootMode
 from helpers.format_config import DataFormat, is_dest_acc_needed
 from helpers.golden_generators import MatmulGolden, get_golden_generator
-from helpers.llk_params import DestAccumulation, MathFidelity
+from helpers.llk_params import (
+    ALL_MATH_FIDELITIES,
+    DEST_ACC_MODES,
+    DestAccumulation,
+    MathFidelity,
+)
 from helpers.matmul_sweep import (
     generate_matmul_dimension_combinations,
     generate_tile_dims,
@@ -48,7 +53,6 @@ MATMUL_FORMATS = input_output_formats(
         DataFormat.Bfp8_b,
     ]
 )
-DEST_ACC_MODES = [DestAccumulation.No, DestAccumulation.Yes]
 
 
 def _run_matmul_custom(
@@ -132,12 +136,7 @@ def _run_matmul_custom(
 
 
 @parametrize(
-    math_fidelity=[
-        MathFidelity.LoFi,
-        MathFidelity.HiFi2,
-        MathFidelity.HiFi3,
-        MathFidelity.HiFi4,
-    ],
+    math_fidelity=ALL_MATH_FIDELITIES,
     formats=MATMUL_FORMATS,
     dest_acc=DEST_ACC_MODES,
     # dimensions depends on (formats, dest_acc): the max result-tile count is set by
