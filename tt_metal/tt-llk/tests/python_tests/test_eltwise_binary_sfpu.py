@@ -2268,7 +2268,9 @@ def _golden_sfpu_binary_bcast(
         b_bcast = b[:, 0].unsqueeze(1).expand_as(b)
 
     golden_rm = op(a, b_bcast.contiguous()).flatten()
-    return tilize_block(golden_rm, [32, 32], stimuli_format=stimuli_format).flatten()
+    return tilize_block(
+        golden_rm, TILE_DIMENSIONS, stimuli_format=stimuli_format
+    ).flatten()
 
 
 def _run_sfpu_binary_bcast(

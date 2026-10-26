@@ -65,6 +65,7 @@ from helpers.sfpu_dispatch_constants import (
     UNARY_MAX_MIN_VALUE,
 )
 from helpers.sfpu_domains import dest_truncation_mask, nan_survives_to_l1
+from helpers.tile_constants import MAX_NUM_FACES_C_DIM, MAX_NUM_FACES_R_DIM
 from helpers.tilize_untilize import tilize_block, untilize_block
 from helpers.unpack import (
     unpack_mxfp4,
@@ -1239,7 +1240,9 @@ class TransposeGolden:
             )
 
         tensor = self._quantize_transpose_input(tensor, data_format)
-        faces = tensor.reshape(num_tiles, 2, 2, FACE_DIM, FACE_DIM)
+        faces = tensor.reshape(
+            num_tiles, MAX_NUM_FACES_R_DIM, MAX_NUM_FACES_C_DIM, FACE_DIM, FACE_DIM
+        )
         axes = (0, 1, 2, 4, 3) if within_faces else (0, 2, 1, 3, 4)
         result = faces.permute(axes).reshape(-1)
 
@@ -1701,7 +1704,7 @@ class BroadcastGolden:
         # Calculate output size based on variable face dimensions
         elements_per_tile = face_r_dim * FACE_DIM * num_faces
 
-        face_cols = min(num_faces, 2)
+        face_cols = min(num_faces, MAX_NUM_FACES_C_DIM)
         tiles = input_flat[: tile_cnt * elements_per_tile].reshape(
             tile_cnt, num_faces // face_cols, face_cols, face_r_dim, FACE_DIM
         )
@@ -2676,9 +2679,14 @@ class UnarySFPUGolden:
             )
 
         window = slice(start, start + elements_to_process)
+        # 16-bit GELU must use scalar erf: SIMD changes its cancellation-tail staircase.
+        scalar_gelu = operation == MathOperation.Gelu and self._work_dtype() in (
+            torch.bfloat16,
+            torch.float16,
+        )
         if whole_tensor_res is not None:
             op_res = whole_tensor_res.tolist()[window]
-        elif operation in self._TENSOR_OPS:
+        elif operation in self._TENSOR_OPS and not scalar_gelu:
             work_dtype = torch.float64
             if operation in self._TENSOR_WORK_OPS:
                 work_dtype = self._work_dtype()
@@ -2840,7 +2848,7 @@ class UnarySFPUGolden:
     def _elementwise_result(result, x):
         return result if isinstance(x, torch.Tensor) else result.item()
 
-    def _in_fp64(self, x, fn):
+    def _in_fp64(self, x, fn) -> float | torch.Tensor:
         """*fn* of *x* in fp64, rounded once to the dtype *x* arrives in: the work dtype
         (:meth:`_work_dtype`) for a scalar. What torch does for a 16-bit tensor anyway,
         which computes in fp32 and rounds once; at a 32-bit Dest it is the fp64 golden
@@ -2851,8 +2859,10 @@ class UnarySFPUGolden:
         result = fn(tensor.to(torch.float64)).to(tensor.dtype)
         return self._elementwise_result(result, x)
 
-    def _torch_unary(self, x, torch_fn):
-        """Apply torch_fn to scalar x in fp64, then enforce the format-aware NaN rule:
+    def _torch_unary(self, x, torch_fn) -> float | torch.Tensor:
+        """Apply torch_fn to scalar or tensor x in fp64, preserving the input kind.
+
+        Enforce the format-aware NaN rule:
         convert +/-inf to NaN when the dest is A-exponent (Float16). fp64 so that a
         Float32-output cell is measured against a correctly rounded reference rather
         than one carrying torch's own fp32 error.
@@ -4132,6 +4142,7 @@ RESHUFFLE_ROWS_FUSER_MASK = [
 
 @register_golden
 class BinarySFPUGolden(EltwiseBinaryGolden):
+    # Atan2 stays scalar because SIMD rounding can change its one-ULP bf16 reference.
     _TENSOR_OPS = frozenset(
         {
             MathOperation.SfpuElwLt,
@@ -4167,7 +4178,6 @@ class BinarySFPUGolden(EltwiseBinaryGolden):
             MathOperation.SfpuGcd,
             MathOperation.SfpuLcm,
             MathOperation.SfpuRsubInt32,
-            MathOperation.SfpuAtan2,
             MathOperation.SfpuCopyDest,
             MathOperation.SfpuMulInt32,
             MathOperation.SfpuLogsigmoid,

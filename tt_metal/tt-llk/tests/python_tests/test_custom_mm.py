@@ -174,7 +174,7 @@ def _build_custom_mm(
             ]
             # Face-major (tilized) layout inside each 32x32 tile. Tilize in the input
             # format so the returned dtype matches the packer (pack_fp32 rejects a
-            # bfloat16 tensor, which is tilize's default Float16_b dtype).
+            # bfloat16 tensor, which is tilize_block's default Float16_b dtype).
             tiled_blk = tilize_block(
                 blk,
                 dimensions=[DEFAULT_TILE_R_DIM, DEFAULT_TILE_C_DIM],

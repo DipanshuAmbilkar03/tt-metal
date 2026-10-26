@@ -105,7 +105,7 @@ def test_unp_bcast_sub_sdpa(
             reconstructed_tiles.append(tile_32x32.flatten())
 
     tilized_reconstructed_tiles = [
-        tilize_block(tile, [32, 32]).flatten() for tile in reconstructed_tiles
+        tilize_block(tile, TILE_DIMENSIONS).flatten() for tile in reconstructed_tiles
     ]
 
     golden = []
