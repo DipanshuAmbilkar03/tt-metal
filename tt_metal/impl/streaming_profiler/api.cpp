@@ -163,11 +163,11 @@ private:
 };
 
 // The byte offset of each data field in a record the decoder writes directly, found by building one record per field
-// with only that field's bits set. A type with values or a String field, or with a field narrower than its bytes, is
-// built instead. A bool shows one bit, so it counts as whole when no other field shares its byte.
+// with only that field's bits set. A type with values, or with a field narrower than its bytes, is built instead. A
+// bool shows one bit, so it counts as whole when no other field shares its byte.
 std::optional<std::vector<uint32_t>> direct_offsets(const api::detail::Kind& kind) {
     const std::span<const uint16_t> codes = kind.data_codes;
-    if (!kind.value_types.empty() || std::ranges::find(codes, kStringCode) != codes.end()) {
+    if (!kind.value_types.empty()) {
         return std::nullopt;
     }
     std::vector<std::byte> samples(kind.size * codes.size());

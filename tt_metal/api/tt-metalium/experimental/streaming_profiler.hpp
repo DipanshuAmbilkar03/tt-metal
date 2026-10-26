@@ -308,6 +308,15 @@ constexpr bool follows_rules() {
         return check_struct<T>();
     }
 }
+// Whether a payload holds a String, which only metadata can.
+template <typename Payload>
+constexpr bool holds_string() {
+    const auto has_string = [](std::span<const uint16_t> codes) {
+        return std::ranges::find(codes, type_code<String>()) != codes.end();
+    };
+    return has_string(leaf_type_codes<Payload>) ||
+           std::ranges::any_of(value_types<Payload>, [&](const ValueType& value) { return has_string(value.codes); });
+}
 
 inline constexpr std::size_t kMaxRecordTypes = 64;
 
@@ -410,6 +419,9 @@ private:
                 std::ranges::find(detail::leaf_type_codes<Metadata>, detail::type_code<Timestamp>()) ==
                     detail::leaf_type_codes<Metadata>.end(),
                 "Timestamps in metadata are not supported");
+            static_assert(
+                !detail::holds_string<Payload>(),
+                "strings are not supported in a payload; send the text as metadata, a DevicePublish call per string");
             static_assert(
                 alignof(Record) <= alignof(std::max_align_t),
                 "alignment beyond alignof(std::max_align_t) is not supported");

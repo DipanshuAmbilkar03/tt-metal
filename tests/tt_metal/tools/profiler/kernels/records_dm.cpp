@@ -15,6 +15,7 @@ constexpr uint16_t kRisc = 1;
 #endif
 
 using namespace records_test;
+using tt::tt_metal::experimental::streaming_profiler::kNoInline;
 using tt::tt_metal::experimental::streaming_profiler::kPublishImmediately;
 
 #define EXAMPLE_PRINT(fmt, ...) \
@@ -50,7 +51,8 @@ void kernel_main() {
         DeviceZoneScopedN("records-iteration");
         DevicePublish<NocSite{"noc_async_read"_s, NocType::Read, 0xFF8000}>(NocEvent{{uint16_t(i), kRisc}, i * 64});
         DevicePublish<Name{"tiles"_s}>(i, float(i) * 0.5f);
-        DevicePublish<Name{"mixed"_s}>(uint8_t(i), "Ada"_s, uint64_t(i) << 33, i % 2 == 1);
+        DevicePublish<Name{"mixed"_s}>(uint8_t(i), uint64_t(i) << 33, i % 2 == 1);
+        DevicePublish<Name{"no inline"_s}, kNoInline>(uint64_t(i));
         DevicePublish<Name{"noc type"_s}>(NocType::Write, uint8_t(i));
         DevicePublish<Name{"tile stats"_s}, kPublishImmediately>(TileStats{i, i * 2048, i * 100, i % 3});
         DevicePublish<Name{"start"_s}>();
@@ -65,13 +67,13 @@ void kernel_main() {
         DevicePublish<Name{"bf16 row"_s}>(std::array<Bf16, 2>{Bf16{uint16_t(i)}, Bf16{uint16_t(i + 1)}});
         DevicePublish<Name{"ragged"_s}>(
             Ragged{uint16_t(i << 8 | 1), uint8_t(i)}, Ragged{uint16_t(i << 8 | 2), uint8_t(i)});
-        const Hole hole{i, "Ada"_s, uint16_t(i % 8), uint16_t(i % 32)};
+        const Hole hole{i, "Ada", uint16_t(i % 8), uint16_t(i % 32)};
         DevicePublish<Name{"hole"_s}>(hole);
         DevicePublish<Name{"hole value"_s}>(hole, i);
-        DevicePublish<Hole{7, "Ada"_s, 5, 17}>();
+        DevicePublish<Hole{7, "Ada", 5, 17}>();
         DevicePublish<Name{"tight bits"_s}>(TightBits{i, uint8_t(i), uint16_t(i + 1)});
         DevicePublish<Name{"flags"_s}>(LaneFlags{i % 8, i % 32, i});
-        DevicePublish<Name{"tagged flags"_s}>(TaggedFlags{"Ada"_s, i % 8, int32_t(i % 16) - 8});
+        DevicePublish<Name{"tagged flags"_s}>(TaggedFlags{"Ada", i % 8, int32_t(i % 16) - 8});
         DevicePublish<Name{"packed"_s}>(Packed{uint8_t(i), i * 3});
         DevicePublish<Name{"wide"_s}>(Wide{i, i + 1});
         DevicePublish<Name{"with empty"_s}>(WithEmpty{{}, i});
@@ -82,7 +84,7 @@ void kernel_main() {
         DevicePublish<LaneFlags{5, 17, 1000}>();
         publish_from_helper();
         [] { DevicePublish<From{"lambda"_s}>(); }();
-        EXAMPLE_PRINT("hello {} iteration {} big {}", "Ada"_s, i, uint64_t(i) << 33);
+        EXAMPLE_PRINT("hello Ada iteration {} big {}", i, uint64_t(i) << 33);
         const Timestamp start = Timestamp::now();
         DevicePublish<Name{"stamped"_s}>(Stamped{Timestamp::now(), i});
         DevicePublish<Name{"since start"_s}>(Stamped{kernel_start, i});

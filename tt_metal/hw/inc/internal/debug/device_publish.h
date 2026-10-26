@@ -23,6 +23,10 @@ namespace tt::tt_metal::experimental::streaming_profiler {
 /** @brief The DevicePublish option that makes a record visible to the host as soon as it is written. */
 inline constexpr struct PublishImmediately {
 } kPublishImmediately{};
+/** @brief The DevicePublish option that writes the record out of line even when the profiler is inlined, so the call
+ * site costs only a call. */
+inline constexpr struct NoInline {
+} kNoInline{};
 }  // namespace tt::tt_metal::experimental::streaming_profiler
 
 namespace kernel_profiler {
@@ -34,10 +38,15 @@ namespace kernel_profiler::records {
 
 template <typename... Options>
 constexpr bool check_options() {
-    constexpr bool known = (std::is_same_v<std::remove_cv_t<Options>, sp::PublishImmediately> && ...);
-    static_assert(known, "unknown DevicePublish option; the only one is kPublishImmediately");
+    constexpr bool known =
+        ((std::is_same_v<std::remove_cv_t<Options>, sp::PublishImmediately> ||
+          std::is_same_v<std::remove_cv_t<Options>, sp::NoInline>) &&
+         ...);
+    static_assert(known, "unknown DevicePublish option; the options are kPublishImmediately and kNoInline");
     return known;
 }
+template <typename Option, auto... Options>
+inline constexpr bool kHasOption = (std::is_same_v<std::remove_cv_t<decltype(Options)>, Option> || ...);
 
 // The type a call site describes an argument as: its own, or a std::array for a C array.
 template <typename Argument>
@@ -447,22 +456,34 @@ constexpr bool check_values(std::index_sequence<I...>) {
     return (spd::check_value<ValueAt<Data, I>>() & ... & true);
 }
 // The rules a DevicePublish call's types follow, given its arguments' types as forwarding references deduce them, with
-// the profiler on or off; true when they all hold. Each mistake is one error: a string literal passed without _s is one
-// rather than a cascade.
+// the profiler on or off; true when they all hold. Each mistake is one error: a string literal passed as an argument is
+// one rather than a cascade. A string travels only in metadata, so a call that would pick one at runtime branches over
+// DevicePublish calls instead, one per string.
 template <typename Metadata, typename... Args>
 constexpr bool check_call() {
     if constexpr ((is_text_literal<Args> || ...)) {
-        static_assert(!(is_text_literal<Args> || ...), "strings sent with DevicePublish need an _s suffix: \"text\"_s");
+        static_assert(
+            !(is_text_literal<Args> || ...),
+            "strings are not supported in a payload; send the text as metadata, a DevicePublish call per string");
         return false;
     } else {
         using Data = RecordData<Args...>;
         constexpr bool metadata = spd::check_struct<Metadata>();
         constexpr bool data = check_values<Data>(ValueIndices<Data>{});
         if constexpr (metadata && data) {
-            constexpr auto kLongest = kSendsDistances<Data> ? spd::TimeForm::Full : spd::TimeForm::Medium;
-            static_assert(
-                kForm<Data, kLongest>.body_words <= ppfmt::LENGTH_MASK,
-                "this record is over the 504-byte limit (500 with Timestamp fields); split it into several records");
+            if constexpr (holds<Data>(spd::kStringCode)) {
+                static_assert(
+                    !holds<Data>(spd::kStringCode),
+                    "strings are not supported in a payload; send the text as metadata, a DevicePublish call per "
+                    "string");
+                return false;
+            } else {
+                constexpr auto kLongest = kSendsDistances<Data> ? spd::TimeForm::Full : spd::TimeForm::Medium;
+                static_assert(
+                    kForm<Data, kLongest>.body_words <= ppfmt::LENGTH_MASK,
+                    "this record is over the 504-byte limit (500 with Timestamp fields); split it into several "
+                    "records");
+            }
         }
         return metadata && data;
     }
@@ -1103,15 +1124,15 @@ FORCE_INLINE uint32_t register_word(const Source& source, std::index_sequence<K.
     }
 }
 
-// A record with a run crosses publish_with's call by its source's address, which the run copies from; any other record
-// as its register words, so a small record stays in registers when the profiler isn't inlined.
-template <bool kImmediately, typename Data, typename Source, size_t... A>
+// A record with a run crosses the writer's call by its source's address, which the run copies from; any other record
+// as its register words, so a small record stays in registers when the writer isn't inlined.
+template <bool kImmediately, bool kNoInline, typename Data, typename Source, size_t... A>
 FORCE_INLINE void publish_record(uint32_t header, const Source& source, std::index_sequence<A...>) {
     if constexpr (kHasRun<Data>) {
-        publish_with<RecordWriter<Data, Source>, kImmediately>(header, &source);
+        publish_with<RecordWriter<Data, Source>, kImmediately, kNoInline>(header, &source);
     } else {
         constexpr auto pieces = std::make_index_sequence<kPieces<Data>.size()>{};
-        publish_with<RecordWriter<Data, RegisterWords<Data>>, kImmediately>(
+        publish_with<RecordWriter<Data, RegisterWords<Data>>, kImmediately, kNoInline>(
             header, register_word<Data, A>(source, pieces)...);
     }
 }
@@ -1124,10 +1145,11 @@ struct CallSite {
     static FORCE_INLINE void publish(Values&&... values) {
         if constexpr (check_call<decltype(kMetadata), Values...>() && check_options<decltype(Options)...>()) {
             using Data = RecordData<Values...>;
-            constexpr bool immediately =
-                (std::is_same_v<std::remove_cv_t<decltype(Options)>, sp::PublishImmediately> || ...);
+            constexpr bool immediately = kHasOption<sp::PublishImmediately, Options...>;
+            // Only an inlined profiler has a writer to keep out of line; otherwise every call site shares one.
+            constexpr bool no_inline = kHasOption<sp::NoInline, Options...> && kProfilerInlined;
             const uint32_t header = site_header<kMetadata, Data, ppfmt::record_w0(kFirstBody<Data>)>();
-            publish_record<immediately, Data>(
+            publish_record<immediately, no_inline, Data>(
                 header,
                 record_source(values...),
                 std::make_index_sequence<std::tuple_size_v<decltype(RegisterWords<Data>::words)>>{});

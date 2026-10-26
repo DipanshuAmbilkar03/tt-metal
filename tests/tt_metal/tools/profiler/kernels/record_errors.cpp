@@ -72,7 +72,7 @@ void kernel_main() {
 #elif RECORD_ERROR == 2
     DevicePublish<Name{"text"}>();
 #elif RECORD_ERROR == 3
-    DevicePublish<Name{"error"_s}>(Name{"text"});
+    DevicePublish<Name{"error"_s}>(Name{"text"_s});
 #elif RECORD_ERROR == 4
     DevicePublish<Name{"error"_s}>(WithConstructor{1});
 #elif RECORD_ERROR == 5
@@ -116,5 +116,7 @@ void kernel_main() {
     DevicePublish<Name{"error"_s}>(LongField{1});
 #elif RECORD_ERROR == 22
     DevicePublish<Name{"error"_s}>(LateField{1, 2, 3});
+#elif RECORD_ERROR == 23
+    DevicePublish<Name{"error"_s}>("text"_s);
 #endif
 }

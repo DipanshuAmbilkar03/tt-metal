@@ -228,8 +228,10 @@ constexpr uint32_t MIN_RESERVE_WORDS = 5;
 
 #if defined(PROFILE_INLINE_ENABLED)
 #define PROFILER_INLINE_ATTR inline __attribute__((always_inline))
+constexpr bool kProfilerInlined = true;
 #else
 #define PROFILER_INLINE_ATTR __attribute__((noinline))
+constexpr bool kProfilerInlined = false;
 #endif
 
 // The pending stall, straight into the reserve its wait left room for, as a zone's medium record
@@ -291,8 +293,8 @@ FORCE_INLINE void ring_ensure_room(uint32_t nwords) {
 
 // Writes one record timed now, which Writer builds from `header`, its call site's word 0, and `inputs`. The clock is
 // read before the room check, so a stall the check waits out follows the record rather than lengthening it.
-template <typename Writer, bool kImmediately = false, typename... Inputs>
-PROFILER_INLINE_ATTR void publish_with(uint32_t header, Inputs... inputs) {
+template <typename Writer, bool kImmediately, typename... Inputs>
+FORCE_INLINE void write_record(uint32_t header, Inputs... inputs) {
     uint32_t time_hi, time_lo;
     read_wall_clock(time_hi, time_lo);
     ring_ensure_room(Writer::kMaxWords);
@@ -302,6 +304,21 @@ PROFILER_INLINE_ATTR void publish_with(uint32_t header, Inputs... inputs) {
         publish_tail();
     } else {
         publish_tail_batched(wIndex - start);
+    }
+}
+template <typename Writer, bool kImmediately, typename... Inputs>
+__attribute__((noinline)) void write_record_out_of_line(uint32_t header, Inputs... inputs) {
+    write_record<Writer, kImmediately>(header, inputs...);
+}
+
+// write_record, inlined into the call site when the profiler is inlined, unless the call site asked for kNoInline,
+// which only an inlined profiler passes.
+template <typename Writer, bool kImmediately = false, bool kNoInline = false, typename... Inputs>
+PROFILER_INLINE_ATTR void publish_with(uint32_t header, Inputs... inputs) {
+    if constexpr (kNoInline) {
+        write_record_out_of_line<Writer, kImmediately>(header, inputs...);
+    } else {
+        write_record<Writer, kImmediately>(header, inputs...);
     }
 }
 

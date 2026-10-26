@@ -155,8 +155,10 @@ Callback stats = RegisterCallback([](const Batch<Record<TileStats, Name>>& batch
 A kernel can pass arguments one by one instead of a struct. `DevicePublish<Name{"tiles"_s}>(count, ratio)`, with a
 `uint32_t` count and a `float` ratio, reaches a callback as `Record<Arguments<std::variant<uint32_t, float>>, Name>`.
 
-Payload fields and arguments use fixed-width types such as `uint32_t` and `float`, `String` for text, and `Timestamp`
-for a time a kernel takes with `Timestamp::now()`. The full rules are in `api/debug/device_publish.h`.
+Payload fields and arguments use fixed-width types such as `uint32_t` and `float`, and `Timestamp` for a time a kernel
+takes with `Timestamp::now()`. Text is `String`, and goes only in metadata: to send text chosen at runtime, branch over
+`DevicePublish` calls, one per text, and pass `kNoInline` so each branch costs only a call. The full rules are in
+`api/debug/device_publish.h`.
 
 ## Where to go next
 

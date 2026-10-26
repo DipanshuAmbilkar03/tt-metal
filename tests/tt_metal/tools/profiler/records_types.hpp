@@ -76,10 +76,10 @@ struct Stamped {
     uint32_t iteration;
 };
 
-// Bit-fields that share a halfword, after a String.
+// Bit-fields that share a halfword, after a char array.
 struct Hole {
     uint64_t iteration;
-    String name;
+    char name[4];
     uint16_t a : 3;
     uint16_t b : 5;
 };
@@ -108,7 +108,7 @@ struct LaneFlags {
     uint32_t count : 24;
 };
 struct TaggedFlags {
-    String name;
+    char name[4];
     uint32_t kind : 3;
     int32_t delta : 5;
 };

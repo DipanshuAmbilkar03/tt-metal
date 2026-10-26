@@ -62,7 +62,7 @@ const std::map<std::string, uint64_t> kExpectedCounts{
     {"records-iteration zones", 2 * kRecordsPerSite},              // "records-iteration"
     {"long zones", 2 * kCores},                                    // "long", once per kernel
     {"NocEvent + NocSite", 2 * kRecordsPerSite},                   // "noc_async_read"
-    {"NameValue + Name", (5 + 2 * 2) * kRecordsPerSite},           // "tiles", "mixed", "bf16"
+    {"NameValue + Name", (5 + 3 * 2) * kRecordsPerSite},           // "tiles", "mixed", "bf16", "no inline"
     {"no data + From", 2 * 2 * kRecordsPerSite},                   // "helper", "lambda"
     {"Burst + Name", 2 * kRecordsPerSite},                         // "burst"
     {"RowValue + Name", 3 * 2 * kRecordsPerSite},                  // "row", "ids", "tag"
@@ -100,8 +100,8 @@ constexpr uint64_t kKernelTicksBound = uint64_t{1} << 34;
 // A long zone starts within this many ticks of the time its processor takes just before opening it.
 constexpr uint64_t kLongZoneStartWithinTicks = 1000;
 
-using NameValue = std::variant<uint8_t, uint32_t, uint64_t, float, bool, std::string_view, Bf16>;
-using FormatValue = std::variant<std::string_view, uint32_t, uint64_t>;
+using NameValue = std::variant<uint8_t, uint32_t, uint64_t, float, bool, Bf16>;
+using FormatValue = std::variant<uint32_t, uint64_t>;
 using RowValue = std::variant<uint32_t, std::span<const float>, std::span<const uint32_t>, std::span<const char>>;
 using BitsValue = std::variant<uint32_t, Hole, LaneFlags, TightBits>;
 using TypedValue = std::variant<uint8_t, NocType>;
@@ -122,7 +122,8 @@ bool sent_as_row(std::span<const RowValue> values) {
 
 std::optional<uint64_t> sent_in(const Hole& hole) {
     const uint32_t a = hole.a, b = hole.b;
-    return hole.iteration < kIterations && a == hole.iteration % 8 && b == hole.iteration % 32 && hole.name == "Ada"
+    return hole.iteration < kIterations && a == hole.iteration % 8 && b == hole.iteration % 32 &&
+                   std::string_view(hole.name) == "Ada"
                ? std::optional(hole.iteration)
                : std::nullopt;
 }
@@ -240,10 +241,12 @@ constexpr std::string_view kUnsupportedType =
     "struct or array";
 constexpr std::string_view kOverLimit =
     "this record is over the 504-byte limit (500 with Timestamp fields); split it into several records";
+constexpr std::string_view kPayloadString =
+    "strings are not supported in a payload; send the text as metadata, a DevicePublish call per string";
 constexpr ExpectedError kErrors[] = {
-    {1, true, false, "strings sent with DevicePublish need an _s suffix: \"text\"_s"},
+    {1, true, false, kPayloadString},
     {2, true, false, "strings sent with DevicePublish need an _s suffix: \"text\"_s"},
-    {3, true, false, "strings sent with DevicePublish need an _s suffix: \"text\"_s"},
+    {3, true, false, kPayloadString},
     {4, true, false, "types with a constructor, private field or virtual function are not supported"},
     {5, true, false, "templates, function-local types and types in an anonymous namespace are not supported"},
     {6, true, false, "templates, function-local types and types in an anonymous namespace are not supported"},
@@ -254,7 +257,7 @@ constexpr ExpectedError kErrors[] = {
     {11, true, false, "empty arrays are not supported"},
     {12, true, false, "templates, function-local types and types in an anonymous namespace are not supported"},
     {13, true, false, kOverLimit},
-    {14, true, false, "unknown DevicePublish option; the only one is kPublishImmediately"},
+    {14, true, false, "unknown DevicePublish option; the options are kPublishImmediately and kNoInline"},
     {15, true, false, "types with a custom copy, move or destructor are not supported"},
     {16, true, false, kUnsupportedType},
     {17, true, false, "unions are not supported; send the member it holds"},
@@ -263,6 +266,7 @@ constexpr ExpectedError kErrors[] = {
     {20, false, true, "two kernels send different types named Clash"},
     {21, false, false, "records_test::LongField has different fields in kernels than on the host"},
     {22, false, false, "field 2 of records_test::LateField lies past the bytes a record carries"},
+    {23, true, false, kPayloadString},
 };
 
 // Each case is one build of record_errors.cpp, on both data-movement RISCs when the case sets on_both_dm_riscs. A build
@@ -367,11 +371,14 @@ int main(int argc, char** argv) {
                 }
                 if (name == "mixed") {
                     const auto* iteration = value_at<uint8_t>(payload, 0);
-                    const auto* who = value_at<std::string_view>(payload, 1);
-                    const auto* big = value_at<uint64_t>(payload, 2);
-                    const auto* odd = value_at<bool>(payload, 3);
-                    return payload.size() == 4 && iteration && who && big && odd && *iteration < kIterations &&
-                           *who == "Ada" && *big == uint64_t(*iteration) << 33 && *odd == (*iteration % 2 == 1);
+                    const auto* big = value_at<uint64_t>(payload, 1);
+                    const auto* odd = value_at<bool>(payload, 2);
+                    return payload.size() == 3 && iteration && big && odd && *iteration < kIterations &&
+                           *big == uint64_t(*iteration) << 33 && *odd == (*iteration % 2 == 1);
+                }
+                if (name == "no inline") {
+                    const auto* iteration = value_at<uint64_t>(payload, 0);
+                    return payload.size() == 1 && iteration && *iteration < kIterations;
                 }
                 const auto* bf16 = value_at<Bf16>(payload, 0);
                 const auto* count = value_at<uint32_t>(payload, 1);
@@ -448,7 +455,7 @@ int main(int argc, char** argv) {
             });
             results.each<Record<void, Hole>>(batch, "no data + Hole", [](const auto& record) {
                 const Hole& hole = record.metadata();
-                return hole.iteration == 7 && hole.name == "Ada" && hole.a == 5 && hole.b == 17;
+                return hole.iteration == 7 && std::string_view(hole.name) == "Ada" && hole.a == 5 && hole.b == 17;
             });
             results.each<Record<TightBits, Name>>(batch, "TightBits + Name", [](const auto& record) {
                 return record.metadata().name == "tight bits" && sent_in(record.payload()).has_value();
@@ -460,8 +467,8 @@ int main(int argc, char** argv) {
                 const auto& payload = record.payload();
                 const uint32_t kind = payload.kind;
                 const int32_t delta = payload.delta;
-                return record.metadata().name == "tagged flags" && payload.name == "Ada" && delta >= -8 && delta < 8 &&
-                       kind == uint32_t(delta + 8) % 8;
+                return record.metadata().name == "tagged flags" && std::string_view(payload.name) == "Ada" &&
+                       delta >= -8 && delta < 8 && kind == uint32_t(delta + 8) % 8;
             });
             results.each<Record<Packed, Name>>(batch, "Packed + Name", [](const auto& record) {
                 const auto& payload = record.payload();
@@ -522,13 +529,12 @@ int main(int argc, char** argv) {
                 batch, "no data + Name", [](const auto& record) { return record.metadata().name == "start"; });
             results.each<Record<Arguments<FormatValue>, Format>>(batch, "FormatValue + Format", [](const auto& record) {
                 const auto& payload = record.payload();
-                const auto* who = value_at<std::string_view>(payload, 0);
-                const auto* iteration = value_at<uint32_t>(payload, 1);
-                const auto* big = value_at<uint64_t>(payload, 2);
-                return payload.size() == 3 && who && iteration && big && *who == "Ada" && *iteration < kIterations &&
+                const auto* iteration = value_at<uint32_t>(payload, 0);
+                const auto* big = value_at<uint64_t>(payload, 1);
+                return payload.size() == 2 && iteration && big && *iteration < kIterations &&
                        *big == uint64_t(*iteration) << 33 &&
-                       record.metadata().format == "hello {} iteration {} big {}" &&
-                       record.metadata().arguments == R"("Ada"_s, i, uint64_t(i) << 33)";
+                       record.metadata().format == "hello Ada iteration {} big {}" &&
+                       record.metadata().arguments == "i, uint64_t(i) << 33";
             });
             results.each<Record<Sample, PlotStyle>>(batch, "Sample + PlotStyle", [](const auto& record) {
                 const auto& payload = record.payload();
