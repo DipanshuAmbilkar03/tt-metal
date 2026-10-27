@@ -228,12 +228,14 @@ Located locate_one(
     const uint32_t csb = chunk_size_bytes(spec.tensor, tpc);
     const uint32_t tpc_page = kcs;
     if (policy.bank_order == BankOrder::Identity) {
-        const uint32_t row = d.fold_layers > 0 ? slot * d.fold_layers + layer : slot;
+        // The ND-shard ravel: the batch row (slot, or slot and layer when folded), then the chip's local head.
+        const uint32_t batch_row = d.fold_layers > 0 ? slot * d.fold_layers + layer : slot;
+        const uint32_t row = head.has_value() ? batch_row * d.n_heads_per_dev + *head % d.n_heads_per_dev : batch_row;
         const uint32_t page_id = row * (per_dev_seq / tpc_page) + local_pos / tpc_page;
         const uint32_t in_page_offset = (local_pos % tpc_page) * (csb / tpc_page);
         const uint32_t bank_id = page_id % d.num_banks;
         const uint64_t off = base + static_cast<uint64_t>(page_id / d.num_banks) * csb + in_page_offset;
-        return {bank_id, off, owner, 0};
+        return {bank_id, off, owner, head.has_value() ? *head / d.n_heads_per_dev : 0};
     }
     // OPTIMAL indexer: fixed permutation over num_blocks; per-bank slot stacking (ND-shard). `banks` is
     // the OPTIMAL perm here (this branch is the bank_order == Optimal case).
@@ -321,12 +323,18 @@ KvChunkAddressTable to_chunk_map(
             "to_chunk_map: cache '{}' folds its layers into the batch axis, which only the Natural scheme with "
             "the Identity bank order addresses",
             config.name);
+        TT_FATAL(
+            !config.head.has_value() || (d.head_axis.has_value() && *config.head < d.n_heads),
+            "to_chunk_map: cache '{}' selects head {} of {} heads, but its topology shards no head axis or has fewer",
+            config.name,
+            config.head.value_or(0),
+            d.n_heads);
         derived.push_back(d);
 
         const KvChunkAddressTableConfig table_config{
             .num_layers = geometry.num_layers,
             .max_sequence_length = geometry.max_seq_len,
-            .num_slots = geometry.num_slots * d.n_heads,
+            .num_slots = config.head.has_value() ? geometry.num_slots : geometry.num_slots * d.n_heads,
             .chunk_n_tokens = d.tpc,
             .chunk_size_bytes = chunk_size_bytes(config.spec.tensor, d.tpc),
         };
@@ -392,7 +400,9 @@ KvChunkAddressTable to_chunk_map(
             if (!published) {
                 continue;
             }
-            for (uint32_t h = 0; h < d.n_heads; ++h) {
+            const uint32_t first_head = config.head.value_or(0);
+            const uint32_t end_head = config.head.has_value() ? *config.head + 1 : d.n_heads;
+            for (uint32_t h = first_head; h < end_head; ++h) {
                 const std::optional<uint32_t> head = per_head ? std::optional<uint32_t>(h) : std::nullopt;
                 for (uint32_t slot = 0; slot < geometry.num_slots; ++slot) {
                     for (uint32_t pos = 0; pos < extent && pos < geometry.max_seq_len; pos += geometry.position_step) {
@@ -401,7 +411,8 @@ KvChunkAddressTable to_chunk_map(
                         const DeviceGroupIndex grp =
                             table.add_device_group(device_group(config.topology, d, loc, cache_mesh, mesh_shape));
                         const uint64_t noc_addr = (static_cast<uint64_t>(loc.bank_id) << 32) | addr_local(loc.offset);
-                        const uint32_t map_slot = per_head ? (h * geometry.num_slots + slot) : slot;
+                        const bool fanned = per_head && !config.head.has_value();
+                        const uint32_t map_slot = fanned ? (h * geometry.num_slots + slot) : slot;
                         table.set(
                             layer,
                             pos,

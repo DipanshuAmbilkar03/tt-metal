@@ -145,8 +145,8 @@ void bind_cache_layout_api(nb::module_& mod) {
         (TensorTopology), its GenerationPolicy and buffer address, its table config name (empty => its
         index; all empty or all set), the layers it publishes (ascending; empty => every layer it holds),
         the model layers [first_layer, first_layer + num_layers) it holds (num_layers 0 => through the
-        last), and its mesh (None => the model's). Caches sharing a name are one table config, one per
-        pipeline stage.
+        last), its mesh (None => the model's), and for a head-sharded cache the one head it holds (None =>
+        every head, fanned into slots). Caches sharing a name are one table config, one per pipeline stage.
     )")
         .def(
             "__init__",
@@ -159,7 +159,8 @@ void bind_cache_layout_api(nb::module_& mod) {
                const std::vector<uint32_t>& layers,
                uint32_t first_layer,
                uint32_t num_layers,
-               std::optional<tt::tt_fabric::MeshId> mesh_id) {
+               std::optional<tt::tt_fabric::MeshId> mesh_id,
+               std::optional<uint32_t> head) {
                 new (t) CacheConfig{
                     .spec = spec,
                     .topology = topology,
@@ -169,7 +170,8 @@ void bind_cache_layout_api(nb::module_& mod) {
                     .layers = layers,
                     .first_layer = first_layer,
                     .num_layers = num_layers,
-                    .mesh_id = mesh_id};
+                    .mesh_id = mesh_id,
+                    .head = head};
             },
             nb::arg("spec"),
             nb::arg("topology"),
@@ -179,7 +181,8 @@ void bind_cache_layout_api(nb::module_& mod) {
             nb::arg("layers") = std::vector<uint32_t>{},
             nb::arg("first_layer") = 0,
             nb::arg("num_layers") = 0,
-            nb::arg("mesh_id") = nb::none())
+            nb::arg("mesh_id") = nb::none(),
+            nb::arg("head") = nb::none())
         .def_rw("spec", &CacheConfig::spec)
         .def_rw("topology", &CacheConfig::topology)
         .def_rw("policy", &CacheConfig::policy)
@@ -188,7 +191,8 @@ void bind_cache_layout_api(nb::module_& mod) {
         .def_rw("layers", &CacheConfig::layers)
         .def_rw("first_layer", &CacheConfig::first_layer)
         .def_rw("num_layers", &CacheConfig::num_layers)
-        .def_rw("mesh_id", &CacheConfig::mesh_id);
+        .def_rw("mesh_id", &CacheConfig::mesh_id)
+        .def_rw("head", &CacheConfig::head);
 
     nb::class_<MapGeometry>(mod, "MapGeometry", "The (layer, slot, position) grid a table is enumerated over.")
         .def(

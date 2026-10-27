@@ -37,7 +37,8 @@ struct MapGeometry {
 // A cache holds the model's layers [first_layer, first_layer + num_layers) on one mesh: all of them, or one
 // pipeline stage's. A tensor whose batch axis (axis 0) holds num_slots * num_layers rows folds its layers
 // into it, user-major: row = slot * num_layers + (layer - first_layer) (the prefill write layout).
-// Otherwise every layer of the cache resolves to the same rows.
+// Otherwise every layer of the cache resolves to the same rows. Under the Natural scheme with the Identity
+// bank order, a head-sharded cache's local heads follow the row: row * heads_per_chip + local_head.
 struct CacheConfig {
     KvLayoutSpec spec;
     TensorTopology topology;
@@ -57,6 +58,9 @@ struct CacheConfig {
     uint32_t num_layers = 0;
     // The mesh this cache lives on; nullopt => the mesh to_chunk_map is called with.
     std::optional<tt::tt_fabric::MeshId> mesh_id;
+    // For a cache whose topology shards a head axis: the one head this config holds, its slots kept as
+    // slots; nullopt => every head, fanned into the slots (slot = head * num_slots + slot).
+    std::optional<uint32_t> head;
 };
 
 // The commonized factory. `configs` is a model expressed as an ordered LIST of co-resident caches

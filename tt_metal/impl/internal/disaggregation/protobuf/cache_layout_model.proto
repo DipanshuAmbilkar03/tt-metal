@@ -37,6 +37,8 @@ message CacheLayoutConfig {
     uint32 num_layers = 8;
     // The mesh the cache lives on; absent => the model's mesh_id.
     optional uint32 mesh_id = 9;
+    // The one head of a head-sharded cache this config holds; absent => every head, fanned into slots.
+    optional uint32 head = 10;
 }
 
 message CacheTensorLayoutSpec {

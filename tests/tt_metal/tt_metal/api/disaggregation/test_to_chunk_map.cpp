@@ -646,6 +646,112 @@ TEST(ToChunkMap, CPU_FirstTableDifferenceNamesTheFirstDifferingCell) {
     EXPECT_NE(missing->find("config '08' layer 4"), std::string::npos) << *missing;
 }
 
+// --- Gemma-4 sliding K/V (models/demos/gemma4_d_p/tt/runners/kv_chunk_table.py) ---
+// One tensor per layer, per chip [num_users, heads_per_chip, seq_len / cp, 256]; head h on TP column
+// h / heads_per_chip. Each head is its own named config. The writer's shard ravel is user-major, then the
+// chip's local head: shard = (slot * heads_per_chip + local_head) * blocks + local_row / 32.
+constexpr uint32_t kGemmaCp = 2;
+constexpr uint32_t kGemmaTp = 2;
+constexpr uint32_t kGemmaHeads = 4;  // two per chip
+constexpr uint32_t kGemmaHeadsPerChip = kGemmaHeads / kGemmaTp;
+constexpr uint32_t kGemmaHeadDim = 256;
+constexpr uint32_t kGemmaSeqLen = 256;
+constexpr uint32_t kGemmaChunk = 128;
+constexpr uint32_t kGemmaUsers = 2;
+constexpr uint32_t kGemmaLayers = 2;
+constexpr uint32_t kGemmaChunkBytes = (kGemmaHeadDim / kTileLocal) * kBfp8TileBytesLocal;
+
+uint64_t gemma_base(uint32_t layer) { return 0x100000ull * (layer + 1); }
+
+CacheLayoutModel gemma_sliding_model() {
+    GenerationPolicy policy;
+    policy.bank_scheme = BankScheme::Natural;
+    policy.bank_order = BankOrder::Identity;
+    policy.k_chunk_size = KChunkSize{kTileLocal};
+    policy.device_chunk_size = DeviceChunkSize{kGemmaChunk / kGemmaCp};
+    const KvLayoutSpec spec{
+        .tensor = make_bfp8_ndshard_spec(
+            Shape{kGemmaUsers, kGemmaHeads, kGemmaSeqLen, kGemmaHeadDim}, Shape{1, 1, kTileLocal, kGemmaHeadDim}),
+        .temporal = temporal::Dense{},
+        .arch = tt::ARCH::BLACKHOLE};
+    const TensorTopology topology(
+        MeshShape{kGemmaCp, kGemmaTp},
+        {MeshMapperConfig::Shard{.dim = 2}, MeshMapperConfig::Shard{.dim = 1}},
+        row_major_coords(kGemmaCp, kGemmaTp));
+
+    CacheLayoutModel model;
+    for (uint32_t layer = 0; layer < kGemmaLayers; ++layer) {
+        for (uint32_t h = 0; h < kGemmaHeads; ++h) {
+            model.caches.push_back(CacheConfig{
+                .spec = spec,
+                .topology = topology,
+                .policy = policy,
+                .base_addr = gemma_base(layer),
+                .name = fmt::format("sliding_k_h{:02d}", h),
+                .first_layer = layer,
+                .num_layers = 1,
+                .head = h});
+        }
+    }
+    model.mesh_shape = MeshShape{kGemmaCp, kGemmaTp};
+    model.geometry = MapGeometry{
+        .num_layers = kGemmaLayers, .num_slots = kGemmaUsers, .max_seq_len = kGemmaSeqLen, .position_step = kTileLocal};
+    return model;
+}
+
+TEST(ToChunkMap, CPU_GemmaSlidingHeadsMatchTheWritersShardRavel) {
+    const KvChunkAddressTable table = to_chunk_map(gemma_sliding_model());
+    ASSERT_EQ(table.num_configs(), kGemmaHeads);
+    const uint32_t local_tokens = kGemmaChunk / kGemmaCp;
+    const uint32_t blocks = kGemmaSeqLen / kGemmaCp / kTileLocal;
+    uint32_t checked = 0;
+    for (uint32_t h = 0; h < kGemmaHeads; ++h) {
+        const uint32_t cfg = table.config_id_of(fmt::format("sliding_k_h{:02d}", h));
+        EXPECT_EQ(table.config(cfg).num_slots, kGemmaUsers);
+        for (uint32_t layer = 0; layer < kGemmaLayers; ++layer) {
+            for (uint32_t slot = 0; slot < kGemmaUsers; ++slot) {
+                for (uint32_t pos = 0; pos < kGemmaSeqLen; pos += kTileLocal) {
+                    const uint32_t in_chunk = pos % kGemmaChunk;
+                    const uint32_t cp_row = in_chunk / local_tokens;
+                    const uint32_t local_row = (pos / kGemmaChunk) * local_tokens + in_chunk % local_tokens;
+                    const uint32_t shard =
+                        (slot * kGemmaHeadsPerChip + h % kGemmaHeadsPerChip) * blocks + local_row / kTileLocal;
+                    const KvCacheLocation loc = table.lookup(layer, pos, slot, cfg);
+                    EXPECT_EQ(loc.size_bytes, kGemmaChunkBytes);
+                    EXPECT_EQ(addr_channel(loc.noc_addr), shard % kNumBanks) << "h=" << h << " pos=" << pos;
+                    EXPECT_EQ(
+                        addr_local(loc.noc_addr),
+                        static_cast<uint32_t>(gemma_base(layer) + (shard / kNumBanks) * kGemmaChunkBytes))
+                        << "h=" << h << " layer=" << layer << " slot=" << slot << " pos=" << pos;
+                    const auto& group = table.get_device_group(loc.device_group_index);
+                    ASSERT_EQ(group.fabric_node_ids.size(), 1u);
+                    EXPECT_EQ(group.fabric_node_ids[0].chip_id, cp_row * kGemmaTp + h / kGemmaHeadsPerChip);
+                    ++checked;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(checked, kGemmaHeads * kGemmaLayers * kGemmaUsers * (kGemmaSeqLen / kTileLocal));
+}
+
+TEST(ToChunkMap, CPU_AHeadSelectorNeedsAHeadShardedTopology) {
+    CacheLayoutModel model = m3_prefill_model(kOneMesh);
+    model.caches.front().head = 0;  // M3's K head config shards no head axis
+    EXPECT_ANY_THROW(to_chunk_map(model));
+    model = gemma_sliding_model();
+    model.caches.front().head = kGemmaHeads;
+    EXPECT_ANY_THROW(to_chunk_map(model));
+}
+
+TEST(CacheLayoutModel, CPU_AHeadSelectorRoundTrips) {
+    const CacheLayoutModel model = gemma_sliding_model();
+    const CacheLayoutModel imported = import_cache_layout_model_from_protobuf(export_to_protobuf(model));
+    for (size_t i = 0; i < model.caches.size(); ++i) {
+        EXPECT_EQ(imported.caches[i].head, model.caches[i].head);
+    }
+    EXPECT_EQ(first_table_difference(to_chunk_map(model), to_chunk_map(imported)), std::nullopt);
+}
+
 TEST(CacheLayoutModel, CPU_RoundTripsThroughProtobufToTheSameTable) {
     for (const PrefillLayout& layout : {kOneMesh, kTwoStages}) {
         const CacheLayoutModel model = m3_prefill_model(layout);
