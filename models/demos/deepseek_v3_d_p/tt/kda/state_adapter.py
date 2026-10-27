@@ -27,7 +27,7 @@ them apart:
   ``p`` lives at bank ``p % N``, offset ``(p // N) * 384``, which is where ND shard ``s = p`` would
   live, so the bytes and the table math are the same while the write becomes a plain whole-row copy.
 
-Exports take the slot as a replicated one-element UINT32 device tensor (``slot_index``, or the traced
+Exports take the slot as a replicated one-element UINT32 device tensor (``device_scalar``, or the traced
 metadata's slot word) and write slab batch ``slot * L + layer_position`` with ``indexed_entry_copy``, which
 resolves the batch on device. A captured export therefore follows the slot written before each replay.
 Imports run outside any capture and keep a host slot.
@@ -369,10 +369,10 @@ def slab_rows_to_convolution(rows: ttnn.Tensor, geometry: KdaContractGeometry) -
     return convolution
 
 
-def slot_index(device: ttnn.Device | ttnn.MeshDevice, slot: int) -> ttnn.Tensor:
-    """A host slot as the replicated one-element UINT32 device tensor exports and loads take."""
+def device_scalar(device: ttnn.Device | ttnn.MeshDevice, value: int) -> ttnn.Tensor:
+    """A host integer as the replicated one-element UINT32 row-major DRAM tensor the KDA ops and copies read on device."""
     return ttnn.from_torch(
-        torch.tensor([slot], dtype=torch.int64),
+        torch.tensor([value], dtype=torch.int64),
         dtype=ttnn.uint32,
         layout=ttnn.ROW_MAJOR_LAYOUT,
         device=device,
@@ -526,7 +526,7 @@ class KdaStates:
             )
 
     def export_layer(self, state: KdaState, slot: ttnn.Tensor, layer_idx: int) -> None:
-        """Write one layer's native state into its slot's batch; ``slot`` is read on device (see ``slot_index``)."""
+        """Write one layer's native state into its slot's batch; ``slot`` is read on device (see ``device_scalar``)."""
         position = self.layer_position(layer_idx)
         export_recurrent(self.recurrent, state.recurrent, slot, self.num_layers, position)
         export_convolution(self.convolution, state.convolution, slot, self.num_layers, position, self.geometry)

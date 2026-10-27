@@ -30,7 +30,7 @@ from models.demos.deepseek_v3_d_p.tt.attn_res.attn_res import TtAttnRes
 from models.demos.deepseek_v3_d_p.tt.attn_res.attn_res_stream import BLOCK_SIZE, TtAttnResWalk
 from models.demos.deepseek_v3_d_p.tt.attn_res.weights import CHECKPOINT_PREFIX, load_attn_res_weights
 from models.demos.deepseek_v3_d_p.tt.kda.config import KIMI_K3_PROJECTION_DTYPE
-from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, K3KdaChunk, build_attention
+from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, build_attention, build_kda_scalars
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.block import TtKimiK3Block
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.kda_state import KdaStateCache
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.layer_schedule import KimiK3LayerSchedule
@@ -495,8 +495,13 @@ class TtKimiK3Transformer(LightweightModule):
             f"snapshots, expected {self.inbound_planes - 1}"
         )
 
-        # Eager chunks build the KDA bounds and slot once and share them across the KDA layers.
-        kda_chunk = K3KdaChunk(actual_start, actual_end, cache_user_id) if metadata is None else None
+        # The KDA layers' slot and bounds, built once per chunk: borrowed from `metadata` when traced,
+        # uploaded from the host ints when eager (and freed below). A rank without KDA layers uploads nothing.
+        kda_scalars, owned_scalars = (
+            build_kda_scalars(self.mesh_device, metadata, cache_user_id, actual_start, actual_end)
+            if self.kda_states is not None
+            else (None, ())
+        )
         try:
             for local_idx, layer in enumerate(self.layers):
                 ctx = K3AttnContext(
@@ -507,7 +512,7 @@ class TtKimiK3Transformer(LightweightModule):
                     actual_start=actual_start,
                     actual_end=actual_end,
                     metadata=metadata,
-                    kda_chunk=kda_chunk,
+                    kda_scalars=kda_scalars,
                 )
                 layer.forward(
                     residual,
@@ -522,8 +527,8 @@ class TtKimiK3Transformer(LightweightModule):
                 if layer_tap is not None and not layer.kv_only:
                     layer_tap(local_idx, residual.current())
         finally:
-            if kda_chunk is not None:
-                kda_chunk.release()
+            for scalar in owned_scalars:
+                ttnn.deallocate(scalar)
 
         if self.kv_only_last_layer:
             # Nothing downstream reads the output; the walk's remaining sites go unconsumed.

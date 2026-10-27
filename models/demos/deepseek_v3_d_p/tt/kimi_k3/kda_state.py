@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import ttnn
 from models.demos.deepseek_v3_d_p.tt.kda.kda import KdaState, ttKDA
-from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import KdaStates, slot_index
+from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import KdaStates, device_scalar
 
 
 def _entries_like(state: KdaState, num_slots: int, device) -> KdaState:
@@ -133,7 +133,7 @@ class KdaStateCache:
         """Stage `slot`'s carry into this layer's working carry and return it. BORROWED, read-only.
 
         `slot` is a replicated one-element UINT32 device tensor (the traced metadata's slot word, or
-        `slot_index`), read on device, so a captured load follows the slot written before each replay.
+        `device_scalar`), read on device, so a captured load follows the slot written before each replay.
         """
         working = self._working[layer_idx]
         _copy_entry(self._entries[layer_idx], working, slot)
@@ -160,7 +160,7 @@ class KdaStateCache:
         previous one's. Call this outside a captured region — at `actual_start == 0` — since a trace
         replays every chunk and would re-zero each time.
         """
-        index = self._slot_index(slot)
+        index = self._device_scalar(slot)
         for layer_idx, entries in self._entries.items():
             _copy_entry(self._zeros[layer_idx], entries, index)
             if self._slabs is not None:
@@ -171,7 +171,7 @@ class KdaStateCache:
         """Overwrite one carry from the contract copy (a migrated-in state). Outside any capture."""
         if self._slabs is None:
             raise RuntimeError("no KDA state slabs bound; nothing to import from")
-        index = self._slot_index(slot)
+        index = self._device_scalar(slot)
         staged = self._layers[layer_idx].allocate_state(batch_size=1)
         self._slabs.import_layer(staged, slot, layer_idx)
         _copy_entry(staged, self._entries[layer_idx], index)
@@ -180,7 +180,7 @@ class KdaStateCache:
 
     def read(self, layer_idx: int, slot: int = 0) -> KdaState:
         """A copy of `slot`'s committed carry for this layer. OWNED: the caller frees both tensors."""
-        index = self._slot_index(slot)
+        index = self._device_scalar(slot)
         copy = self._layers[layer_idx].allocate_state(batch_size=1)
         _copy_entry(self._entries[layer_idx], copy, index)
         ttnn.deallocate(index)
@@ -193,7 +193,7 @@ class KdaStateCache:
                 ttnn.deallocate(state.convolution)
         self._working, self._entries, self._zeros = {}, {}, {}
 
-    def _slot_index(self, slot: int) -> ttnn.Tensor:
+    def _device_scalar(self, slot: int) -> ttnn.Tensor:
         if not 0 <= slot < self._num_slots:
             raise ValueError(f"slot {slot} out of range [0, {self._num_slots})")
-        return slot_index(self._device, slot)
+        return device_scalar(self._device, slot)

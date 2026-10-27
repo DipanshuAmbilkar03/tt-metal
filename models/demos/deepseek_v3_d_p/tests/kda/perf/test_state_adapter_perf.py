@@ -40,7 +40,7 @@ from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     deallocate_state,
     export_state,
     import_state,
-    slot_index,
+    device_scalar,
 )
 from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import assert_bit_identical, make_actual_start
 
@@ -214,7 +214,7 @@ def test_kimi_k3_state_adapter_cost(
     ttnn.synchronize_device(mesh_device)
     allocation_ms = (time.perf_counter() - allocation_start) * 1e3
     physical = _physical_contract(contract, slabs, geometry)
-    slot = slot_index(mesh_device, 0)  # the export reads its slot on device, as the traced commit does
+    slot = device_scalar(mesh_device, 0)  # the export reads its slot on device, as the traced commit does
 
     # Production path, cold: one export at the layer's commit and one import back.
     cold = {

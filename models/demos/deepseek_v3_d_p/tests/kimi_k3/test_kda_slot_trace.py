@@ -25,9 +25,9 @@ from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     KdaContractGeometry,
     KdaStates,
     deallocate_state,
-    slot_index,
+    device_scalar,
 )
-from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention
+from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention, build_kda_scalars
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.kda_state import KdaStateCache
 from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import assert_bit_identical, make_actual_start
 
@@ -106,7 +106,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
 
     input_tt = upload(chunk_input(0, 0))
     slot_tt, start_tt, end_tt = (
-        slot_index(mesh_device, 0),
+        device_scalar(mesh_device, 0),
         make_actual_start(mesh_device, 0),
         make_actual_start(mesh_device, capacity),
     )
@@ -120,9 +120,10 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
             ttnn.copy(source, input_tt)
             ttnn.deallocate(source)
             before = carries()
-            output = attention.forward(
-                input_tt, K3AttnContext(actual_start=start, actual_end=start + length, cache_user_id=slot)
-            )
+            scalars, owned = build_kda_scalars(mesh_device, None, slot, start, start + length)
+            output = attention.forward(input_tt, K3AttnContext(kda_scalars=scalars))
+            for scalar in owned:
+                ttnn.deallocate(scalar)
             observed = observe(output, start, length)
             ttnn.deallocate(output)
             other = 1 - slot
@@ -134,7 +135,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
             eager.append(observed)
 
         # One capture, recorded on slot 0. Warm until program and resource state settle first.
-        ctx = K3AttnContext(actual_start=999, actual_end=999, metadata=(slot_tt, start_tt, end_tt))
+        ctx = K3AttnContext(kda_scalars=(slot_tt, start_tt, end_tt))
         for _ in range(2):
             ttnn.deallocate(attention.forward(input_tt, ctx))
         trace = ttnn.begin_trace_capture(mesh_device, cq_id=0)
@@ -151,7 +152,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
                 staged = make_actual_start(mesh_device, value)
                 ttnn.copy(staged, destination)
                 ttnn.deallocate(staged)
-            staged = slot_index(mesh_device, slot)
+            staged = device_scalar(mesh_device, slot)
             ttnn.copy(staged, slot_tt)
             ttnn.deallocate(staged)
             ttnn.execute_trace(mesh_device, trace, cq_id=0, blocking=True)

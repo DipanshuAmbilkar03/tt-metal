@@ -27,7 +27,7 @@ from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     assemble_recurrent,
     convolution_segment_to_torch,
     recurrent_segment_to_torch,
-    slot_index,
+    device_scalar,
 )
 from models.demos.deepseek_v3_d_p.utils.kv_cache_utils import (
     KDA_VERSIONS,
@@ -155,7 +155,7 @@ def test_slabs_round_trip_replay_and_table(mesh_device, device_params, layer_ids
     }
     natives = {key: _native_from_global(mesh_device, geometry, *value) for key, value in patterns.items()}
     for (slot, layer), state in natives.items():
-        index = slot_index(mesh_device, slot)
+        index = device_scalar(mesh_device, slot)
         slabs.export_layer(state, index, layer)
         ttnn.deallocate(index)
     ttnn.synchronize_device(mesh_device)
@@ -205,7 +205,7 @@ def test_slabs_round_trip_replay_and_table(mesh_device, device_params, layer_ids
     # 3. A captured export follows the carry's contents and the device slot on replay, and touches
     #    nothing else: captured on slot 0, replayed with the last slot written into the slot tensor.
     victim = natives[(0, layer_ids[0])]
-    slot_tt = slot_index(mesh_device, 0)
+    slot_tt = device_scalar(mesh_device, 0)
     trace_id = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     slabs.export_layer(victim, slot_tt, layer_ids[0])
     ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
@@ -214,7 +214,7 @@ def test_slabs_round_trip_replay_and_table(mesh_device, device_params, layer_ids
     ttnn.copy(staged.recurrent, victim.recurrent)
     ttnn.copy(staged.convolution, victim.convolution)
     replay_slot = num_slots - 1
-    staged_slot = slot_index(mesh_device, replay_slot)
+    staged_slot = device_scalar(mesh_device, replay_slot)
     ttnn.copy(staged_slot, slot_tt)
     ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=True)
     ttnn.synchronize_device(mesh_device)

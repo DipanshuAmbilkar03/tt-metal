@@ -32,9 +32,9 @@ import ttnn
 from models.demos.deepseek_v3_d_p.tt.kda.kda import ttKDA
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import (
     K3AttnContext,
-    K3KdaChunk,
     TtK3KdaAttention,
     build_attention,
+    build_kda_scalars,
 )
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.block import TtKimiK3Block
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.transformer import TtKimiK3Transformer
@@ -166,110 +166,85 @@ def test_kda_construction_passes_global_and_local_geometry(monkeypatch, sp_axis,
     assert kwargs["program_config"].recurrence.summary_group_chunks == (10 if sp_axis == 0 else 20)
 
 
-@pytest.mark.parametrize(
-    "host_start,host_end,use_metadata",
-    [(None, None, False), (672, None, False), (672, 704, False), (0, 32, False), (0, 1024, True)],
-)
-def test_kda_forward_uses_live_metadata_or_eager_position(monkeypatch, host_start, host_end, use_metadata):
-    kda = create_autospec(ttKDA, instance=True)
-    kda.device = object()
-    output, new_state, scalar, end_scalar, slot = object(), object(), object(), object(), object()
-    kda.forward.return_value = output, new_state
-    states = Mock()
-    # Host bounds upload first, then the slot; an absent end uploads nothing.
-    from_torch = Mock(side_effect=[scalar, end_scalar, slot] if host_end is not None else [scalar, slot])
-    mapper = object()
-    deallocate = Mock()
+@pytest.mark.parametrize("host_start,host_end", [(None, None), (672, None), (672, 704), (0, 32)])
+def test_build_kda_scalars_uploads_eager_slot_and_bounds_once(monkeypatch, host_start, host_end):
+    device, mapper = object(), object()
+    slot, start, end = object(), object(), object()
+    from_torch = Mock(side_effect=[slot, start, end])
     monkeypatch.setattr(ttnn, "from_torch", from_torch)
     monkeypatch.setattr(ttnn, "ReplicateTensorToMesh", lambda device: mapper)
-    monkeypatch.setattr(ttnn, "deallocate", deallocate)
-    monkeypatch.setattr(ttnn, "all_gather", lambda tensor, **kwargs: tensor)
-    monkeypatch.setattr(ttnn, "squeeze", lambda tensor, **kwargs: tensor)
-    monkeypatch.setattr(ttnn, "unsqueeze", lambda tensor, **kwargs: tensor)
-    attention = TtK3KdaAttention(kda, 1, 1, 1, ttnn.Topology.Linear, states)
-    metadata = (slot, scalar, end_scalar) if use_metadata else None
-    hidden = object()
-    assert (
-        attention.forward(
-            hidden, K3AttnContext(actual_start=host_start, actual_end=host_end, cache_user_id=2, metadata=metadata)
-        )
-        is output
-    )
-    # The carry is selected by a device slot on every path: the metadata's slot word when traced, else
-    # `cache_user_id` uploaded as a scalar, so a capture never pins the slot it was recorded on.
-    states.load.assert_called_once_with(1, slot)
-    kda.forward.assert_called_once_with(
-        hidden,
-        states.load.return_value,
-        actual_start=scalar,
-        actual_end=end_scalar if use_metadata or host_end is not None else None,
-    )
-    states.commit.assert_called_once_with(1, new_state, slot)
-    if use_metadata:
-        from_torch.assert_not_called()
-        assert all(call.args not in ((scalar,), (end_scalar,), (slot,)) for call in deallocate.call_args_list)
-    else:
-        assert from_torch.call_count == (2 if host_end is None else 3)
-        assert torch.equal(from_torch.call_args_list[-1].args[0], torch.tensor([2], dtype=torch.int64))
-        assert any(call.args == (slot,) for call in deallocate.call_args_list)
-        assert torch.equal(
-            from_torch.call_args_list[0].args[0],
-            torch.tensor([0 if host_start is None else host_start], dtype=torch.int64),
-        )
-        if host_end is not None:
-            assert torch.equal(from_torch.call_args_list[1].args[0], torch.tensor([host_end], dtype=torch.int64))
-            assert any(call.args == (end_scalar,) for call in deallocate.call_args_list)
-        assert from_torch.call_args.kwargs == {
-            "dtype": ttnn.uint32,
-            "layout": ttnn.ROW_MAJOR_LAYOUT,
-            "device": kda.device,
-            "memory_config": ttnn.DRAM_MEMORY_CONFIG,
-            "mesh_mapper": mapper,
-        }
-        assert any(call.args == (scalar,) for call in deallocate.call_args_list)
+
+    scalars, owned = build_kda_scalars(device, None, 2, host_start, host_end)
+
+    # Slot first, then the start; an absent end uploads nothing and stays `None` (full capacity).
+    assert scalars == (slot, start, end if host_end is not None else None)
+    assert owned == ((slot, start, end) if host_end is not None else (slot, start))
+    uploaded = [call.args[0] for call in from_torch.call_args_list]
+    expected = [2, 0 if host_start is None else host_start] + ([host_end] if host_end is not None else [])
+    assert [tensor.tolist() for tensor in uploaded] == [[value] for value in expected]
+    assert all(tensor.dtype == torch.int64 for tensor in uploaded)
+    assert from_torch.call_args.kwargs == {
+        "dtype": ttnn.uint32,
+        "layout": ttnn.ROW_MAJOR_LAYOUT,
+        "device": device,
+        "memory_config": ttnn.DRAM_MEMORY_CONFIG,
+        "mesh_mapper": mapper,
+    }
 
 
-def test_kda_chunk_shares_bounds_across_layers(monkeypatch):
-    kdas = [create_autospec(ttKDA, instance=True) for _ in range(2)]
-    device = object()
-    for kda in kdas:
-        kda.device = device
-        kda.forward.return_value = object(), object()
-    start, end, slot = object(), object(), object()
-    from_torch = Mock(side_effect=[start, end, slot])
-    deallocate = Mock()
+def test_build_kda_scalars_borrows_traced_metadata(monkeypatch):
+    from_torch = Mock()
     monkeypatch.setattr(ttnn, "from_torch", from_torch)
-    monkeypatch.setattr(ttnn, "ReplicateTensorToMesh", lambda device: object())
-    monkeypatch.setattr(ttnn, "deallocate", deallocate)
-    monkeypatch.setattr(ttnn, "all_gather", lambda tensor, **kwargs: tensor)
-    monkeypatch.setattr(ttnn, "squeeze", lambda tensor, **kwargs: tensor)
-    monkeypatch.setattr(ttnn, "unsqueeze", lambda tensor, **kwargs: tensor)
-    chunk = K3KdaChunk(5120, 10240, slot=3)
-    ctx = K3AttnContext(actual_start=5120, actual_end=10240, cache_user_id=3, kda_chunk=chunk)
-    states = [Mock() for _ in kdas]
-    for layer_idx, (kda, state) in enumerate(zip(kdas, states)):
-        TtK3KdaAttention(kda, layer_idx, 1, 1, ttnn.Topology.Linear, state).forward(object(), ctx)
-
-    assert from_torch.call_count == 3
-    assert torch.equal(from_torch.call_args_list[2].args[0], torch.tensor([3], dtype=torch.int64))
-    for layer_idx, state in enumerate(states):
-        state.load.assert_called_once_with(layer_idx, slot)
-    for kda in kdas:
-        assert kda.forward.call_args.kwargs == {"actual_start": start, "actual_end": end}
-    # The layers do not free the shared scalars; the transformer releases them once per chunk.
-    assert all(call.args not in ((start,), (end,), (slot,)) for call in deallocate.call_args_list)
-    deallocate.reset_mock()
-    chunk.release()
-    assert [call.args for call in deallocate.call_args_list] == [(start,), (end,), (slot,)]
+    slot, start, end = object(), object(), object()
+    # The host ints are placeholders under trace; the metadata tensors are what replay rewrites.
+    scalars, owned = build_kda_scalars(object(), (slot, start, end, object()), 7, 999, 999)
+    assert scalars == (slot, start, end)
+    assert owned == ()
+    from_torch.assert_not_called()
 
 
 @pytest.mark.parametrize("start,end", [(1, 64), (33, 64), (-32, 32), (32, 32), (64, 32), (32, 31)])
-def test_kda_rejects_invalid_host_bounds_before_device_work(monkeypatch, expect_error, start, end):
+def test_build_kda_scalars_rejects_invalid_host_bounds_before_upload(monkeypatch, expect_error, start, end):
+    from_torch = Mock()
+    monkeypatch.setattr(ttnn, "from_torch", from_torch)
+    with expect_error(ValueError, "K3 KDA"):
+        build_kda_scalars(object(), None, 0, start, end)
+    from_torch.assert_not_called()
+
+
+def test_kda_forward_reads_the_shared_scalars_and_frees_none(monkeypatch):
+    kdas = [create_autospec(ttKDA, instance=True) for _ in range(2)]
+    for kda in kdas:
+        kda.forward.return_value = object(), object()
+    slot, start, end = object(), object(), object()
+    from_torch, deallocate = Mock(), Mock()
+    monkeypatch.setattr(ttnn, "from_torch", from_torch)
+    monkeypatch.setattr(ttnn, "deallocate", deallocate)
+    monkeypatch.setattr(ttnn, "all_gather", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(ttnn, "squeeze", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(ttnn, "unsqueeze", lambda tensor, **kwargs: tensor)
+    # The host ints are MLA's; a KDA layer reads only the scalars, the same objects on every layer.
+    ctx = K3AttnContext(actual_start=5120, actual_end=10240, cache_user_id=3, kda_scalars=(slot, start, end))
+    states = [Mock() for _ in kdas]
+    hidden = object()
+    for layer_idx, (kda, state) in enumerate(zip(kdas, states)):
+        output, new_state = kda.forward.return_value
+        assert TtK3KdaAttention(kda, layer_idx, 1, 1, ttnn.Topology.Linear, state).forward(hidden, ctx) is output
+        # The carry is selected by the device slot, so a capture never pins the slot it was recorded on.
+        state.load.assert_called_once_with(layer_idx, slot)
+        kda.forward.assert_called_once_with(hidden, state.load.return_value, actual_start=start, actual_end=end)
+        state.commit.assert_called_once_with(layer_idx, new_state, slot)
+    from_torch.assert_not_called()
+    # The caller owns the scalars and frees them once per chunk, after its last KDA layer.
+    assert all(call.args not in ((slot,), (start,), (end,)) for call in deallocate.call_args_list)
+
+
+def test_kda_forward_requires_scalars_before_device_work(monkeypatch, expect_error):
     gather = Mock()
     monkeypatch.setattr(ttnn, "all_gather", gather)
     attention = TtK3KdaAttention(Mock(), 1, 1, 1, ttnn.Topology.Linear, Mock())
-    with expect_error(ValueError, "K3 KDA"):
-        attention.forward(object(), K3AttnContext(actual_start=start, actual_end=end))
+    with expect_error(ValueError, "kda_scalars"):
+        attention.forward(object(), K3AttnContext(actual_start=0, actual_end=64))
     gather.assert_not_called()
 
 

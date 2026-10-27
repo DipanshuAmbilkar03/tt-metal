@@ -19,8 +19,8 @@ from models.demos.deepseek_v3_d_p.tests.kda.utils import (
     reconstruct_state_at_sp_rank,
     to_sp_input,
 )
-from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import deallocate_state, slot_index
-from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention
+from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import deallocate_state, device_scalar
+from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention, build_kda_scalars
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.kda_state import KdaStateCache
 from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import assert_bit_identical, make_actual_start
 
@@ -55,11 +55,11 @@ def test_k3_padding_eager_and_trace_continue_exact_carries(mesh_device, sp_axis,
 
     input_tt = upload(hidden)
     slot_tt, start_tt, end_tt = (
-        slot_index(mesh_device, 0),
+        device_scalar(mesh_device, 0),
         make_actual_start(mesh_device, 0),
         make_actual_start(mesh_device, capacity),
     )
-    ctx = K3AttnContext(actual_start=999, actual_end=999, metadata=(slot_tt, start_tt, end_tt))
+    ctx = K3AttnContext(kda_scalars=(slot_tt, start_tt, end_tt))
     # Nonzero carried state before the short intervals, including ends just past
     # the head or a device boundary and a one-tile separated tail on SP ranks.
     cases = [(0, capacity), (32, 32), (96, 64), (32, 96), (32, 224), (0, min(capacity, 288))]
@@ -149,7 +149,10 @@ def test_k3_padding_eager_and_trace_continue_exact_carries(mesh_device, sp_axis,
                     ttnn.execute_trace(mesh_device, trace, cq_id=0, blocking=True)
                     output = traced_output
                 else:
-                    output = attention.forward(input_tt, K3AttnContext(actual_start=start, actual_end=start + length))
+                    scalars, owned = build_kda_scalars(mesh_device, None, 0, start, start + length)
+                    output = attention.forward(input_tt, K3AttnContext(kda_scalars=scalars))
+                    for scalar in owned:
+                        ttnn.deallocate(scalar)
                 committed = cache.read(1)
                 assert_matches_reference(
                     output_tt=output,
