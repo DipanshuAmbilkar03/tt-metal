@@ -2,10 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Program pieces of the sparse KV push shared by its two hosts: the standalone push (SparseKvPushProgramFactory) and
-// the push fused into sparse_sdpa (SparseSDPAPushFusedFactory). Both run the same kernels on the same core layout: one
-// fabric channel per (link, direction), each with kSendersPerChannel sender cores (table reader + writer) feeding one
-// fabric mux core that owns the router connection.
+// Shared by the standalone push and the push fused into sparse_sdpa. One fabric channel per (link, direction), each
+// with kSendersPerChannel sender cores (reader + writer) feeding one mux core that owns the router connection.
 
 #pragma once
 
@@ -73,8 +71,7 @@ inline CoreRangeSet to_range_set(const std::vector<CoreCoord>& cores) {
     return CoreRangeSet(ranges);
 }
 
-// Sender cores first (sender w belongs to channel w / kSendersPerChannel, channel c = link * kDirections + dir), then
-// one mux core per channel.
+// Sender w serves channel w / kSendersPerChannel; channel c = link * kDirections + dir.
 struct CoreLayout {
     uint32_t links = 0;
     std::vector<CoreCoord> senders;
@@ -116,7 +113,7 @@ inline tt::tt_fabric::FabricMuxConfig mux_config(tt::tt_metal::distributed::Mesh
         /*base_l1_address=*/mesh_device->allocator()->get_base_allocator_addr(tt::tt_metal::HalMemType::L1));
 }
 
-// Destination fabric ids (row-major ranks) and mesh shape: both kernels look up every destination's first hop.
+// Both kernels look up every destination's first hop, indexed by row-major rank.
 inline std::map<std::string, std::string> kernel_defines(tt::tt_metal::distributed::MeshDevice* mesh_device) {
     const auto mesh_shape = mesh_device->get_view().shape();
     std::vector<uint32_t> chip_ids, mesh_ids;
@@ -146,7 +143,6 @@ inline std::vector<tt::tt_metal::distributed::MeshCoordinate> torus_neighbors(
     return neighbors;
 }
 
-// What the table reader pushes from the KVPE cache `input` (slot from batch_index_tensor[0] when given).
 struct ReaderConfig {
     const Tensor& input;
     const Tensor& table;
@@ -188,7 +184,6 @@ inline std::vector<uint32_t> reader_compile_args(const ReaderConfig& cfg, uint32
     return ct;
 }
 
-// Reader common runtime args: {input, table, batch index tensor, num layers, layer index, scalar slot}.
 inline std::vector<uint32_t> reader_common_args(
     const ReaderConfig& cfg,
     uint32_t batch_slot_num_layers,
@@ -234,8 +229,7 @@ inline std::vector<uint32_t> writer_compile_args(
     return ct;
 }
 
-// Sender runtime args: {sender, direction, link, sub, sync core x/y, every sender's NoC x/y, mux client ABI}.
-// Works for a Program or a ProgramDescriptor (the mux client semaphores are allocated in it).
+// Templated because the mux client semaphores are allocated in the Program / ProgramDescriptor.
 template <typename ProgramOrDescriptor>
 std::vector<uint32_t> writer_runtime_args(
     tt::tt_metal::distributed::MeshDevice* mesh_device,
@@ -271,7 +265,6 @@ std::vector<uint32_t> writer_runtime_args(
     return rt;
 }
 
-// Mux runtime args of channel c: its connection to the neighbour in that channel's direction.
 template <typename ProgramOrDescriptor>
 std::vector<uint32_t> mux_runtime_args(
     tt::tt_metal::distributed::MeshDevice* mesh_device,

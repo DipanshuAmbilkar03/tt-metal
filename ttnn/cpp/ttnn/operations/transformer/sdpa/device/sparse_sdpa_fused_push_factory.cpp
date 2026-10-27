@@ -2,10 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// sparse_sdpa with a fused next-layer sparse KV push. The attention program is the plain sparse_sdpa one on
-// worker_core_grid; the push of the next layer's prefix rows (sparse_kv_push, part 1: rows written by earlier chunks)
-// is appended on push_core_grid, so the two overlap in one program. The next layer pushes the rest (part 2: its own
-// chunk's rows) before its attention.
+// The next layer's prefix rows (part 1) are pushed on push_core_grid while attention runs; the next layer pushes
+// the rest (part 2) itself, since those rows are only written by this chunk.
 
 #include "ttnn/operations/transformer/sdpa/device/sparse_sdpa_device_operation.hpp"
 #include "ttnn/operations/experimental/sparse_kv_push/device/sparse_push_program.hpp"

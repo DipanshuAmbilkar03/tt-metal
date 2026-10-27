@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// The three TRISCs of a sparse push plan core, workers 2..4 (see sparse_push_plan.cpp): plain RISC-V loops over L1,
-// no Tensix instructions. The math TRISC sets up no circular buffer interfaces, so every TRISC takes its buffer
-// and semaphore addresses from the launch message.
+// Plain RISC-V loops over L1, no Tensix instructions. The math TRISC sets up no CB interfaces, so buffer and
+// semaphore addresses come from the launch message.
 
 #include <cstdint>
 

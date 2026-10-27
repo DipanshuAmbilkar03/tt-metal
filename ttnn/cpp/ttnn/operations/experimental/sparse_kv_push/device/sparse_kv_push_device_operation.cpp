@@ -12,7 +12,6 @@ namespace ttnn::operations::experimental::sparse_kv_push {
 
 namespace {
 
-// The cache is sharded over its rows across the whole mesh; the compact buffer holds rows too.
 constexpr uint32_t kRowDim = 2;
 
 void validate_semaphores(const SparseKvPushParams& args, const Tensor& input_tensor) {
@@ -39,7 +38,7 @@ void validate_semaphores(const SparseKvPushParams& args, const Tensor& input_ten
         data_valid_buffer_type);
 }
 
-// Bounds of the runtime cache slot; the value itself is hash-excluded, so this runs on cache hits too.
+// The slot is not hashed, so this also runs on cache hits.
 void validate_batch_slot(const SparseKvPushParams& args, const SparseKvPushInputs& tensor_args) {
     const uint32_t cache_batch = tensor_args.input_tensor.padded_shape()[0];
     if (tensor_args.batch_index_tensor.has_value()) {
@@ -150,8 +149,7 @@ void SparseKvPushDeviceOperation::validate_on_program_cache_miss(
         output_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
             output_tensor.memory_config().buffer_type() == BufferType::DRAM,
         "sparse_kv_push requires an interleaved DRAM output");
-    // No row-count floor: slots stop at the requester's distinct rows plus per-owner padding, which the caller sizes
-    // for (SparseKvPushPlanner.buffer_rows), so the buffer may be far shorter than the gathered slot.
+    // Row count is unchecked: the caller sizes it for the requester's distinct rows plus per-owner padding.
     TT_FATAL(
         output_shape.rank() == 4 && output_shape[0] == 1 && output_shape[1] == input_shape[1] &&
             output_shape[3] == input_shape[3],
@@ -178,7 +176,7 @@ SparseKvPushDeviceOperation::spec_return_value_t SparseKvPushDeviceOperation::co
 
 SparseKvPushDeviceOperation::topology_return_value_t SparseKvPushDeviceOperation::compute_output_topologies(
     const SparseKvPushParams&, const SparseKvPushInputs& tensor_args) {
-    // Like a full-mesh gather of the rows: every placement sharding them becomes replicated.
+    // Like an all-gather over the rows: placements sharding dim 2 become replicated.
     const auto& input_tensor = tensor_args.input_tensor;
     const auto& input_topology = input_tensor.tensor_topology();
     auto placements = input_topology.placements();
@@ -224,7 +222,6 @@ Tensor sparse_kv_push(
     using namespace ttnn::operations::experimental::sparse_kv_push;
     auto* mesh_device = input_tensor.device();
     TT_FATAL(mesh_device != nullptr, "sparse_kv_push input must be on device");
-    // Default: every worker core of the first sub-device.
     const auto grid = core_grid.value_or(mesh_device->worker_cores(
         tt::tt_metal::HalProgrammableCoreType::TENSIX, mesh_device->get_sub_device_ids().at(0)));
     return ttnn::device_operation::launch<SparseKvPushDeviceOperation>(

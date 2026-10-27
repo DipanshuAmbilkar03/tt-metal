@@ -2,21 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// On-device plan for the sparse KV push (see sparse_push_plan_device_operation.hpp for the table layout).
-// One requester chip, `cores` cores; on each core five workers (BRISC, NCRISC, three TRISCs, see
-// sparse_push_plan_work.hpp) split the L1 loops and BRISC drives the steps and the NOC:
-//   0. load the core's slice of the indices into L1; zero the bitmap, the dirty-chunk bytes and the map column;
-//   1. scatter: the workers bucket their slices by bitmap-word owner and set the bits of their own words, marking
-//      the 512-row chunks touched; they map those marks reducer-major, and BRISC and NCRISC push every dirty chunk
-//      copy to its reducer's scratch and add the map word into the reducer's column;                     [exchange]
-//   2. reduce-scatter, chunk-cyclic (core c reduces chunks c + k * cores) so the sink and local-window chunks every
-//      core touches spread over all cores: the workers OR the pushed copies, split by word;               [exchange]
-//   3. ranks: each core fills the 16-bit in-range ranks, block counts and per-owner partials of its 128-block
-//      ranges;                                                                                             [exchange]
-//   4. per-owner prefixes over the ranges and compact-buffer bases, every core for itself, split by owner;
-//   5. rewrite the core's indices to compact slots (all workers) and write them out.
-// An exchange gathers every core's part on core 0, which multicasts the result (one sender: concurrent multicasts
-// from every core serialize on the NOC). The bitmap is zero before the scatter, so untouched chunks need no sending.
+// Five workers per core (BRISC, NCRISC, three TRISCs) split the L1 loops; BRISC drives the steps and the NOC.
+// Reduce chunks are dealt cyclically so the chunks every core touches (sink, local window) spread over all cores.
 
 #include "api/dataflow/dataflow_api.h"
 #include "sparse_push_plan_work.hpp"
@@ -136,7 +123,6 @@ void kernel_main() {
         post(sem_zeroed, 1);
     };
 #endif
-    // Scatter, then this worker's share of the reducer-major dirty map.
     auto scatter_and_map = [&](uint32_t worker) {
         misc[kMiscRowEnd + worker] =
             scatter_step(idx, n_idx, buckets, bucket_cap, misc + kMiscBucketed, bits, dirty, worker, sem_done, zeroed);
@@ -221,9 +207,7 @@ void kernel_main() {
     };
     const uint32_t arrive_sem = get_semaphore(kSemArrive);
     const uint32_t go_sem = get_semaphore(kSemGo);
-    // Exchange k: every core has written its part to the same offsets on core 0 and counts in there; core 0
-    // multicasts the gathered spans (`spans(f)` calls f(l1, bytes) for each), then the go value. One sender at a
-    // time: concurrent multicasts from every core serialize on the NOC.
+    // Gather on core 0, which multicasts the spans back: concurrent multicasts from every core serialize on the NOC.
     auto exchange = [&](uint32_t k, auto&& spans) {
         noc_async_write_barrier();
         noc_semaphore_inc(core_noc(0, arrive_sem), 1);
@@ -341,7 +325,6 @@ void kernel_main() {
         idx, n_idx, bits, rank16, partials, misc, worker, sem_done);
     wait_workers(kRewritten);
     if (core_idx == 0) {
-        // The split block: rows before the chunk start form the prefix part of each owner's run.
         const uint32_t* totals = misc + kMiscTotals;
         const uint32_t split_block = has_split ? misc[kMiscSplit] / stripe_chunk : active_blocks;
         for (uint32_t o = 0; o < num_devices; ++o) {

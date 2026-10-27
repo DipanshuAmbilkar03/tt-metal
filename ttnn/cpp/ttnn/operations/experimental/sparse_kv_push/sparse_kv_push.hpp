@@ -13,10 +13,8 @@
 
 namespace ttnn::operations::experimental::sparse_kv_push {
 
-// Each owner chip pushes the rows of `input_tensor` (the KVPE cache, sharded over dim 2 across a 2D torus) that a
-// requester's top-k references into that requester's compact `output_tensor`, as described by `table`: the
-// all-gathered sparse_push_plan tables of a cache of max_rows rows (stripe_chunk rows per block-cyclic block).
-// part: 0 = every needed row; 2 = only the rows from the chunk start on (the prefix was pushed by a fused sparse_sdpa).
+// Owner chips push the cache rows each requester's top-k needs into its compact output_tensor, as laid out by the
+// all-gathered sparse_push_plan tables. part 2 skips the prefix rows a fused sparse_sdpa already pushed.
 Tensor sparse_kv_push(
     const Tensor& input_tensor,
     const Tensor& output_tensor,
@@ -28,15 +26,13 @@ Tensor sparse_kv_push(
     uint32_t part = 0,
     uint32_t num_links = 2,
     uint32_t batch_index = 0,
-    // Trace-safe slot: batch_index_tensor[0] * batch_slot_num_layers + batch_slot_layer_idx, read on device
-    // (batch_index is then ignored).
+    // Trace-safe: the slot is read on device as batch_index_tensor[0] * batch_slot_num_layers + batch_slot_layer_idx.
     const std::optional<Tensor>& batch_index_tensor = std::nullopt,
     uint32_t batch_slot_num_layers = 1,
     uint32_t batch_slot_layer_idx = 0,
     const std::optional<CoreRangeSet>& core_grid = std::nullopt);
 
-// On-device plan for the sparse KV push: returns {plan table, indices rewritten to compact slots}
-// (see device/sparse_push_plan_device_operation.hpp).
+// Returns {plan table, indices rewritten to compact-buffer slots}.
 std::vector<Tensor> sparse_push_plan(
     const Tensor& indices,
     uint32_t num_devices,

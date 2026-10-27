@@ -12,10 +12,6 @@
 
 namespace ttnn::operations::experimental::sparse_kv_push {
 
-// Sparse KV push: instead of a full-mesh gather of the whole cache onto every chip, each owner pushes only the rows a
-// requester's top-k references, packed into the requester's compact buffer at the slots the plan op rewrote its
-// indices to (see sparse_push_plan_device_operation.hpp and kernels/sparse_push_table_reader.cpp). sparse_sdpa then
-// reads that buffer through the rewritten indices.
 struct SparseKvPushProgramFactory {
     struct shared_variables_t {
         tt::tt_metal::KernelHandle reader_kernel_id{};

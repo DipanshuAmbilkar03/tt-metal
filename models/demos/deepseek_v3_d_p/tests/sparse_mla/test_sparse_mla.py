@@ -12,6 +12,7 @@ path separate while reusing the same TT execution helper and the production mesh
 / fabric axes from the dense MLA tests.
 """
 
+import contextlib
 import copy
 
 import pytest
@@ -36,6 +37,7 @@ from models.demos.deepseek_v3_d_p.tests.sparse_mla.sparse_mla_reference import (
     run_cpu_reference_ragged,
 )
 from models.demos.deepseek_v3_d_p.tests.test_mla import run_mla_inference
+from models.demos.deepseek_v3_d_p.tt.mla import mla as mla_module
 from models.demos.deepseek_v3_d_p.tt.mla import ttMLA
 from models.demos.deepseek_v3_d_p.tt.mla.indexer import normalized_hadamard_matrix, num_full_indexer_layers
 from models.demos.deepseek_v3_d_p.tt.mla.rope import RotarySetup, interleaved_to_halfsplit_perm
@@ -1076,6 +1078,14 @@ def test_sparse_mla_indexer_reuse_chunked(
     ttnn.synchronize_device(mesh_device)
 
 
+@contextlib.contextmanager
+def _dense_gather():
+    """MLA layers built inside gather the whole KV prefix instead of pushing: the reference the push must match."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mla_module, "sparse_kv_push_supported", lambda mesh_device: False)
+        yield
+
+
 @pytest.mark.parametrize(
     "variant, mesh_device, seq_len, device_params",
     [c for c in SPARSE_REUSE_CASES if "8x4" in c.id or "(8, 4)" in str(c.values)],
@@ -1089,9 +1099,8 @@ def test_sparse_mla_indexer_reuse_chunked(
 def test_sparse_mla_kv_push_matches_gather(
     mesh_device, seq_len, device_params, variant, cache_format, config_only, ds_layer, ds_checkpoint, ds_repo
 ):
-    """Sparse KV push: a layer fed injected top-k indices that pushes only the referenced KV rows into a
-    compact buffer (sparse_kv_push=True) must match the same layer gathering the whole prefix. Same rows in the same
-    index order -> sparse_sdpa sees identical inputs, so the outputs match bit-for-bit."""
+    """A layer fed injected top-k that pushes only the referenced KV rows must match the same layer gathering the
+    whole prefix, bit for bit."""
     config = config_only
     config.max_seq_len = seq_len
     weights, _ = build_weights(variant, config, layer=ds_layer, checkpoint_path=ds_checkpoint, repo=ds_repo)
@@ -1125,12 +1134,9 @@ def test_sparse_mla_kv_push_matches_gather(
         actual_start=0,
     )
     _, _, _, shard_dims, idx = run_mla_inference(tt_kvpe_cache=_kvpe(), return_indices=True, **common)
-    out_gather, _, _, _ = run_mla_inference(
-        tt_kvpe_cache=_kvpe(), inject_indices=idx, mla_kwargs=dict(sparse_kv_push=False), **common
-    )
-    out_push, _, _, _ = run_mla_inference(
-        tt_kvpe_cache=_kvpe(), inject_indices=idx, mla_kwargs=dict(sparse_kv_push=True), **common
-    )
+    with _dense_gather():
+        out_gather, _, _, _ = run_mla_inference(tt_kvpe_cache=_kvpe(), inject_indices=idx, **common)
+    out_push, _, _, _ = run_mla_inference(tt_kvpe_cache=_kvpe(), inject_indices=idx, **common)
 
     def _to_torch(t):
         return ttnn.to_torch(
@@ -1187,8 +1193,8 @@ def test_sparse_mla_kv_push_matches_gather_chunked(
     ds_checkpoint,
     ds_repo,
 ):
-    """Sparse KV push over a growing prefix: per chunk, a layer computing top-k feeds its indices to a
-    gathering layer and a pushing layer (separate caches, nonzero user slot); their outputs must match bit-for-bit."""
+    """Push vs gather over a growing prefix: per chunk, a top-k layer feeds a gathering and a pushing layer
+    (separate caches, nonzero user slot)."""
     config = config_only
     config.max_seq_len = total
     weights, _ = build_weights(variant, config, layer=ds_layer, checkpoint_path=ds_checkpoint, repo=ds_repo)
@@ -1196,7 +1202,7 @@ def test_sparse_mla_kv_push_matches_gather_chunked(
     sp_axis, tp_axis = 0, 1
     num_users, cache_user_id = 2, 1
 
-    def _layer(**kwargs):
+    def _layer():
         mla = ttMLA(
             config,
             weights,
@@ -1210,7 +1216,6 @@ def test_sparse_mla_kv_push_matches_gather_chunked(
             slot_num=num_users,
             layer_num=1,
             sparse_kv_cache_format=cache_format,
-            **kwargs,
         )
         kvpe = init_mla_kv_cache(
             cache_format=cache_format,
@@ -1228,7 +1233,9 @@ def test_sparse_mla_kv_push_matches_gather_chunked(
         )
         return mla, kvpe, index
 
-    full, gather, push = _layer(), _layer(sparse_kv_push=False), _layer(sparse_kv_push=True)
+    full, push = _layer(), _layer()
+    with _dense_gather():
+        gather = _layer()
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )
@@ -1301,8 +1308,8 @@ def test_sparse_mla_kv_push_matches_gather_padded(
     ds_checkpoint,
     ds_repo,
 ):
-    """Sparse KV push vs gather on PADDED chunks whose starts are not chunk-aligned (the server's rotated layout):
-    each split writes `isl` valid rows from an arbitrary start. Full chunks cover the optional aligned prefix first."""
+    """Push vs gather on padded chunks that start mid-slab (the server's rotated layout), after an optional
+    aligned prefix."""
     chunk = 5120
     starts, s = [], 0
     while s < prefix:
@@ -1319,7 +1326,7 @@ def test_sparse_mla_kv_push_matches_gather_padded(
     sp_axis, tp_axis = 0, 1
     num_users, cache_user_id = 2, 1
 
-    def _layer(**kwargs):
+    def _layer():
         mla = ttMLA(
             config,
             weights,
@@ -1333,7 +1340,6 @@ def test_sparse_mla_kv_push_matches_gather_padded(
             slot_num=num_users,
             layer_num=1,
             sparse_kv_cache_format=cache_format,
-            **kwargs,
         )
         kvpe = init_mla_kv_cache(
             cache_format=cache_format,
@@ -1351,7 +1357,9 @@ def test_sparse_mla_kv_push_matches_gather_padded(
         )
         return mla, kvpe, index
 
-    full, gather, push = _layer(), _layer(sparse_kv_push=False), _layer(sparse_kv_push=True)
+    full, push = _layer(), _layer()
+    with _dense_gather():
+        gather = _layer()
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )
@@ -1405,9 +1413,8 @@ def test_sparse_mla_kv_push_matches_gather_padded(
 def test_sparse_mla_kv_push_prefetch_chain(
     mesh_device, seq_len, total, chunk, device_params, variant, config_only, ds_layer, ds_checkpoint, ds_repo
 ):
-    """Push prefetch: in a full -> shared -> shared chain, each layer pushes its successor's prefix rows
-    during its own sparse_sdpa and the successor pushes only its remainder. Every layer's output must match the
-    dense-gather chain bit-for-bit, chunk by chunk (scaled-FP8 cache, nonzero user slot)."""
+    """full -> shared -> shared: each layer pushes its successor's prefix during its own sparse_sdpa. Every layer
+    must match the dense-gather chain bit for bit, chunk by chunk."""
     config = copy.deepcopy(config_only)  # the layer-type override must not leak into other tests
     config.max_seq_len = total
     config.indexer_types = ["full", "shared", "shared"]
@@ -1418,24 +1425,24 @@ def test_sparse_mla_kv_push_prefetch_chain(
     num_users, cache_user_id, n_layers = 2, 1, 3
 
     def _chain(push):
-        layers = [
-            ttMLA(
-                config,
-                weights,
-                mesh_device,
-                layer_idx=i,
-                seq_len=total,
-                sp_axis=sp_axis,
-                tp_axis=tp_axis,
-                is_chunked=True,
-                active_seq_len=chunk,
-                slot_num=num_users,
-                layer_num=n_layers,
-                sparse_kv_cache_format=cache_format,
-                sparse_kv_push=push,
-            )
-            for i in range(n_layers)
-        ]
+        with contextlib.nullcontext() if push else _dense_gather():
+            layers = [
+                ttMLA(
+                    config,
+                    weights,
+                    mesh_device,
+                    layer_idx=i,
+                    seq_len=total,
+                    sp_axis=sp_axis,
+                    tp_axis=tp_axis,
+                    is_chunked=True,
+                    active_seq_len=chunk,
+                    slot_num=num_users,
+                    layer_num=n_layers,
+                    sparse_kv_cache_format=cache_format,
+                )
+                for i in range(n_layers)
+            ]
         kvpe = init_mla_kv_cache(
             cache_format=cache_format,
             hf_config=config,
@@ -1454,7 +1461,7 @@ def test_sparse_mla_kv_push_prefetch_chain(
 
     chains = {False: _chain(False), True: _chain(True)}
     assert (
-        chains[True][0][0]._push_prefetch is not None and chains[True][0][1]._push_prefetch is not None
+        chains[True][0][0]._push_prefetch_grids is not None and chains[True][0][1]._push_prefetch_grids is not None
     ), "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
@@ -1512,11 +1519,8 @@ def test_sparse_mla_kv_push_prefetch_chain(
 def test_sparse_mla_kv_push_prefetch_chain_padded(
     mesh_device, seq_len, prefix, device_params, variant, config_only, ds_layer, ds_checkpoint, ds_repo
 ):
-    """Push prefetch: in a full -> shared -> shared chain, each layer pushes its successor's prefix rows
-    during its own sparse_sdpa and the successor pushes only its remainder. Every layer's output must match the
-    dense-gather chain bit-for-bit, chunk by chunk (scaled-FP8 cache, nonzero user slot). PADDED: after an
-    optional aligned prefix, chunks of 2592/1568/5120/800 valid rows start mid-slab (the server's rotated layout),
-    so the prefix/remainder split block is not a whole block row of every owner."""
+    """The prefetch chain on padded chunks that start mid-slab, so the prefix/remainder split block is not a whole
+    block row of every owner."""
     chunk = 5120
     starts, s = [], 0
     while s < prefix:
@@ -1536,24 +1540,24 @@ def test_sparse_mla_kv_push_prefetch_chain_padded(
     num_users, cache_user_id, n_layers = 2, 1, 3
 
     def _chain(push):
-        layers = [
-            ttMLA(
-                config,
-                weights,
-                mesh_device,
-                layer_idx=i,
-                seq_len=total,
-                sp_axis=sp_axis,
-                tp_axis=tp_axis,
-                is_chunked=True,
-                active_seq_len=chunk,
-                slot_num=num_users,
-                layer_num=n_layers,
-                sparse_kv_cache_format=cache_format,
-                sparse_kv_push=push,
-            )
-            for i in range(n_layers)
-        ]
+        with contextlib.nullcontext() if push else _dense_gather():
+            layers = [
+                ttMLA(
+                    config,
+                    weights,
+                    mesh_device,
+                    layer_idx=i,
+                    seq_len=total,
+                    sp_axis=sp_axis,
+                    tp_axis=tp_axis,
+                    is_chunked=True,
+                    active_seq_len=chunk,
+                    slot_num=num_users,
+                    layer_num=n_layers,
+                    sparse_kv_cache_format=cache_format,
+                )
+                for i in range(n_layers)
+            ]
         kvpe = init_mla_kv_cache(
             cache_format=cache_format,
             hf_config=config,
@@ -1572,7 +1576,7 @@ def test_sparse_mla_kv_push_prefetch_chain_padded(
 
     chains = {False: _chain(False), True: _chain(True)}
     assert (
-        chains[True][0][0]._push_prefetch is not None and chains[True][0][1]._push_prefetch is not None
+        chains[True][0][0]._push_prefetch_grids is not None and chains[True][0][1]._push_prefetch_grids is not None
     ), "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
@@ -1638,10 +1642,8 @@ _TRACED_PUSH_CASES = [
 def test_sparse_mla_kv_push_traced_metadata_slots(
     mesh_device, seq_len, device_params, variant, config_only, ds_layer, ds_checkpoint, ds_repo
 ):
-    """The push chain (full -> shared -> shared, fused prefetch + resume) captured ONCE on the metadata path and
-    replayed for other user slots and chunk starts: only the metadata tensors and the input change in place
-    between replays. Each replay must match the dense-gather chain run eagerly on host scalars, bit for bit.
-    A host-frozen slot, chunk start or KV write offset in the push path shows up as a mismatch here."""
+    """The push chain captured once on the metadata path and replayed over other user slots and chunk starts must
+    match the eager dense-gather chain: a host-frozen slot, chunk start or KV offset shows up as a mismatch."""
     from models.demos.deepseek_v3_d_p.tt.mla.rope import ChunkMetadata, write_chunk_metadata
     from models.demos.deepseek_v3_d_p.utils.sub_device_trace import SubDeviceTraceController
 
@@ -1656,24 +1658,24 @@ def test_sparse_mla_kv_push_traced_metadata_slots(
     num_users, n_layers = 2, 3
 
     def _chain(push):
-        layers = [
-            ttMLA(
-                config,
-                weights,
-                mesh_device,
-                layer_idx=i,
-                seq_len=total,
-                sp_axis=sp_axis,
-                tp_axis=tp_axis,
-                is_chunked=True,
-                active_seq_len=chunk,
-                slot_num=num_users,
-                layer_num=n_layers,
-                sparse_kv_cache_format=cache_format,
-                sparse_kv_push=push,
-            )
-            for i in range(n_layers)
-        ]
+        with contextlib.nullcontext() if push else _dense_gather():
+            layers = [
+                ttMLA(
+                    config,
+                    weights,
+                    mesh_device,
+                    layer_idx=i,
+                    seq_len=total,
+                    sp_axis=sp_axis,
+                    tp_axis=tp_axis,
+                    is_chunked=True,
+                    active_seq_len=chunk,
+                    slot_num=num_users,
+                    layer_num=n_layers,
+                    sparse_kv_cache_format=cache_format,
+                )
+                for i in range(n_layers)
+            ]
         kvpe = init_mla_kv_cache(
             cache_format=cache_format,
             hf_config=config,
@@ -1691,7 +1693,7 @@ def test_sparse_mla_kv_push_traced_metadata_slots(
         return layers, kvpe, index
 
     gather, push = _chain(False), _chain(True)
-    assert push[0][0]._push_prefetch is not None, "the push chain must prefetch"
+    assert push[0][0]._push_prefetch_grids is not None, "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )

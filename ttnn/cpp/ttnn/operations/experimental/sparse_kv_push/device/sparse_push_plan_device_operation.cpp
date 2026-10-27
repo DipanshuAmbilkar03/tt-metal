@@ -15,7 +15,7 @@ namespace ttnn::operations::experimental::sparse_kv_push {
 namespace plan_detail {
 
 constexpr uint32_t kMaxCores = 120;
-// Circular buffers, semaphores and misc-buffer size: see kernels/sparse_push_plan_work.hpp.
+// Must match kernels/sparse_push_plan_work.hpp.
 enum PlanCb : uint32_t {
     kImage = 0,
     kIdx = 1,
@@ -213,7 +213,7 @@ tt::tt_metal::ProgramDescriptor SparsePushPlanDeviceOperation::create_descriptor
         compute.emplace_runtime_args(core_list[i], crt);
     }
     kernel.common_runtime_args = {common.begin(), common.end()};
-    // NCRISC is worker 1: a share of every L1 loop and of the reduce reads.
+    // Same kernel on NCRISC as worker 1.
     tt::tt_metal::KernelDescriptor helper = kernel;
     helper.defines.emplace_back("PLAN_HELPER", "1");
     helper.config = tt::tt_metal::DataMovementConfigDescriptor{

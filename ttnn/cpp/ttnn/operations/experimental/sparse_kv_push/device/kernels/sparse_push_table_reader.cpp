@@ -2,14 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Sparse KV push reader, driven by the all-gathered plan tables (sparse_push_plan_device_operation.hpp). For each
-// requester routed through this sender, the owner reads the requester's per-owner counts (giving its run base in the
-// requester's compact buffer) and scans the requester's bitmap over the blocks this chip owns, in order, turning set
-// bits into local cache rows. Row k of a run goes to packet k / P (P rows per packet), whose rows sit `banks` pages
-// apart in bank lane (k / P) % banks, matching the plan op's rewritten indices.
-//
-// Parts (push_part): 0 every needed row; 1 rows in blocks before the plan's split block (the chunk start: the prefix,
-// pushed by a sparse_sdpa with a fused push); 2 the rest, continuing each run where part 1 ended.
+// push_part 0: every needed row; 1: rows before the plan's split block (fused into sparse_sdpa); 2: the rest,
+// continuing each run where part 1 ended.
 
 #include "api/dataflow/dataflow_api.h"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
@@ -165,9 +159,7 @@ void kernel_main() {
         // This chip's blocks: my_rank, my_rank + N, ...; block jb holds local rows [jb * sc, (jb + 1) * sc).
         const uint32_t active_blocks = header[3] < num_blocks ? header[3] : num_blocks;
         uint32_t my_blocks = active_blocks > my_rank ? (active_blocks - my_rank + num_devices - 1) / num_devices : 0;
-        // This owner's blocks before the split block (the chunk start's block): my_rank + j * N < split. The split is
-        // chunk aligned only when the chunk start is (a padded/rotated chunk starts mid-slab), so it is NOT a whole
-        // block row of every owner: owners below split % N have one more prefix block.
+        // The split need not fall on a whole block row, so owners below split % N get one more prefix block.
         const uint32_t split_block = header[4];
         const uint32_t split_j = split_block > my_rank ? (split_block - my_rank + num_devices - 1) / num_devices : 0;
         uint32_t jb_first = 0;
@@ -219,7 +211,7 @@ void kernel_main() {
         }
     }
     flush_batch();
-    // Terminator.
+    // n = 0 ends the writer.
     cb_reserve_back(kData, 1);
     cb_reserve_back(kMeta, 1);
     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(kMeta))[2] = 0;

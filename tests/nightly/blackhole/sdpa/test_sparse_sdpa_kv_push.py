@@ -158,7 +158,7 @@ _CHUNKS = pytest.mark.parametrize("chunk_global", [5120, 2048], ids=["5k", "2k"]
 @_CHUNKS
 @_KV_FMT
 def test_sparse_sdpa_glm_core_count_perf(mesh_device, chunk_global, kv_fmt):
-    """sparse_sdpa alone on all cores and on the overlap profiles' attention grids, at the GLM shape (traced)."""
+    """sparse_sdpa alone on all cores and on 96- and 80-core subsets, at the GLM shape (traced)."""
     grid = mesh_device.compute_with_storage_grid_size()
     tt_q, tt_kv, tt_idx, chunk_local = _glm_inputs(mesh_device, chunk_global, chunk_global * 51, kv_fmt)
     rows_2_on = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 2), ttnn.CoreCoord(grid.x - 1, grid.y - 1))])
@@ -170,12 +170,6 @@ def test_sparse_sdpa_glm_core_count_perf(mesh_device, chunk_global, kv_fmt):
         )
     logger.info(f"sparse_sdpa GLM {chunk_global} {kv_fmt} traced us per call (grid, us): {rows}")
 
-
-# ---------------------------------------------------------------------------------------------------------
-# Sparse KV push with real GLM-5.3 top-k at a 1M prefix: the next layer's buffer, filled by the prefix push fused
-# into sparse_sdpa plus the remainder push (or by one push of every row), read through the plan's rewritten indices,
-# must give exactly the dense gather's attention.
-# ---------------------------------------------------------------------------------------------------------
 
 _TORUS_XY_GLM = {**_TORUS_XY}
 _GLM_ROUTER = ttnn.FabricRouterConfig()
@@ -196,6 +190,8 @@ _TRACE_1M_START = 1039360  # prompt position of the trace's first row (a whole n
 @pytest.mark.parametrize("mesh_device", [(8, 4)], indirect=True)
 @pytest.mark.parametrize("layer", [14, 62], ids=["L14", "L62"])
 def test_sparse_kv_push_real_topk_matches_gather(mesh_device, layer):
+    """With real 1M top-k, a buffer filled by one full push, and one filled by the fused prefix push plus the
+    remainder, must both give the dense gather's attention exactly."""
     from safetensors.numpy import load_file
 
     from models.demos.deepseek_v3_d_p.tt.mla.sparse_kv_push import _shard_over_mesh
@@ -271,8 +267,7 @@ def test_sparse_kv_push_real_topk_matches_gather(mesh_device, layer):
             data_valid_semaphore=sems[1],
         )
 
-    # Layer L's buffer by one push of every row; layer L + 1's by its prefix fused into layer L's attention, then its
-    # remainder.
+    # Layer L's buffer: one full push. Layer L + 1's: its prefix fused into L's attention, then the remainder.
     compact_l = push(_zero_kv_buffer(mesh_device, buffer_rows, kv_fmt), 0, 0)
     compact_next = _zero_kv_buffer(mesh_device, buffer_rows, kv_fmt)
     sdpa_kw = dict(kv_format=_KV_FORMATS[kv_fmt][0], scale=K_DIM**-0.5, k_chunk_size=128)

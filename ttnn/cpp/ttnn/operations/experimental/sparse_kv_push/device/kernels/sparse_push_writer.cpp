@@ -2,17 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Sparse KV push writer. One fabric channel per (link, direction): every packet whose first hop leaves in that
-// direction goes out on it, so the four directions inject in parallel. Each channel's K senders feed one fabric mux
-// core that owns the router connection.
-//
-// Protocol (worker 0 of every chip is the sync core):
-//   start: sender 0 of each link-0 channel tells the chips in its direction it has started (so each chip hears
-//          once from every other chip); the sync core waits for num_devices - 1, then releases its local senders.
-//          No output is overwritten while its owner still runs an earlier op.
-//   end:   every sender increments done on the sync core of every chip in its direction (on the same route as
-//          its data) and on its own chip's; the sync core waits for (num_devices - 1) * links * K + workers and
-//          consumes it, leaving both semaphores at zero.
+// Worker 0 is each chip's sync core. start: no chip writes into a requester's buffer before that requester has
+// started this op (its previous op is done with the buffer). done: each sender increments every destination's sync
+// core on its data's route, so the count lands after the rows. Both semaphores are left at zero.
 
 #include "api/dataflow/dataflow_api.h"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"

@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// The L1 loops of the sparse push plan, shared by its five workers on each core: BRISC (worker 0), NCRISC (1) and
-// the three TRISCs (2..4). BRISC drives the steps (see sparse_push_plan.cpp); a worker waits for step k, does its
-// share of it and reports k. Nothing here touches the NOC.
+// L1 loops shared by the plan's five workers per core: BRISC (0), NCRISC (1), TRISCs (2..4). A worker waits for
+// step k, does its share and reports k.
 
 #pragma once
 
@@ -17,7 +16,7 @@ constexpr uint32_t kSentinel = 0xFFFFFFFFu;
 constexpr uint32_t kChunkWords = 16;  // bitmap words per dirty chunk
 constexpr uint32_t kChunkShift = 9;   // rows per chunk = 16 * 32
 
-// Circular buffers (same ids on the host side).
+// Must match the host side.
 enum Cb : uint32_t {
     kImage = 0,
     kIdx = 1,
@@ -30,7 +29,6 @@ enum Cb : uint32_t {
     kRank16 = 8
 };
 
-// Words of the misc buffer, written by BRISC before the step that reads them.
 constexpr uint32_t kMiscActiveBlocks = 0;
 constexpr uint32_t kMiscChunks = 1;      // this core's reduce chunks: core_idx + k * cores, k < this
 constexpr uint32_t kMiscRanges = 2;      // block ranges of range_blocks blocks over the active blocks
@@ -48,17 +46,10 @@ constexpr uint32_t kSemArrive = 0, kSemGo = 1, kSemStep = 2, kSemDone = 3;
 constexpr uint32_t kSemZeroed = kSemDone + kWorkers;  // BRISC: the bitmap and the dirty bytes are zero
 constexpr uint32_t kNumSems = kSemZeroed + 1;
 
-// Steps.
-// The scatter has two halves: a worker reports kBucketed once its slice is bucketed and kScattered once it has set
-// the bits of every index handed to it.
+// Steps BRISC posts (kStep*) and progress values workers report, in order.
 constexpr uint32_t kStepScatter = 1, kBucketed = 1, kScattered = 2;
-// Then every worker maps its share of the dirty chunks (kMapped) and the two data movement workers push the dirty
-// copies to their reducers (NCRISC reports kPushed).
 constexpr uint32_t kMapped = 3, kPushed = 4;
-// The OR: a worker lists the copies of its chunks (kListed), then ORs its words of every chunk (kOred).
 constexpr uint32_t kStepOr = 5, kListed = 5, kOred = 6, kStepRange = 7;
-// The bases and the rewrite need no BRISC step: a worker reports kTotalled, waits for every other's totals, reports
-// kBased, waits for every other's bases and rewrites.
 constexpr uint32_t kStepBases = 8, kTotalled = 8, kBased = 9, kRewritten = 10;
 
 inline void fence() { asm volatile("fence" ::: "memory"); }
@@ -76,15 +67,13 @@ inline void post(uint32_t sem_addr, uint32_t v) {
     *reinterpret_cast<volatile uint32_t*>(sem_addr) = v;
 }
 
-// [begin, end) of worker `w`'s share of n items, in contiguous slices.
 inline uint32_t share_begin(uint32_t n, uint32_t w) { return n * w / kWorkers; }
 
 // The worker that sets the bits of bitmap word w: workers own contiguous runs of the residues w % 32, so the
 // words of each worker are disjoint and the bitmap needs no atomics.
 inline uint32_t word_owner(uint32_t w) { return ((w & 31) * kWorkers) >> 5; }
 
-// First half of the scatter: hand each index of this worker's slice [begin, end) to the owner of its bitmap word,
-// in lists of `cap` indices: buckets + (worker * kWorkers + to) * cap. Writes the list lengths to bucketed.
+// List (worker, to) holds the indices worker hands to word owner `to`, at buckets + (worker * kWorkers + to) * cap.
 inline void bucket(
     const uint32_t* idx,
     uint32_t begin,
@@ -116,9 +105,7 @@ inline void bucket(
     out[4] = p4 - (first + 4 * cap);
 }
 
-// Second half: set the bit of every index handed to this worker and mark its 512-row chunk dirty (one byte each;
-// every writer stores 1). Returns the largest such row + 1 (0 = none). The bitmap and the dirty bytes are zero
-// beforehand.
+// Dirty flags are one byte per chunk so concurrent writers need no atomics. Returns the largest row + 1 (0 = none).
 inline uint32_t scatter(
     const uint32_t* buckets, uint32_t cap, const uint32_t* bucketed, uint32_t* bits, uint8_t* dirty, uint32_t worker) {
     // Top-k rows come mostly ascending, so runs of indices share a word and a chunk: keep the current word's bits
@@ -153,7 +140,6 @@ inline uint32_t scatter(
     return row_end;
 }
 
-// Both halves, with the worker hand-off in between (every worker waits for every other's buckets).
 template <typename DoneSem, typename Zeroed>
 inline uint32_t scatter_step(
     const uint32_t* idx,
@@ -175,13 +161,11 @@ inline uint32_t scatter_step(
     return scatter(buckets, cap, bucketed, bits, dirty, worker);
 }
 
-// The dirty buffer, three arrays of round_up(cores, 16) words: [r] this core's map word for reducer r (bit k: chunk
-// r + k * cores is dirty here); then [c] core c's map word for this core, added in by core c (zero beforehand); then
-// [c] core c's largest row + 1, gathered on core 0.
+// Three arrays: [r] this core's map word for reducer r (bit k: chunk r + k * cores is dirty here); [c] core c's map
+// word for this core; [c] core c's largest row + 1, gathered on core 0.
 constexpr uint32_t dirty_array_words(uint32_t cores) { return (cores + 15) / 16 * 16; }
 enum DirtyArray : uint32_t { kMine = 0, kColumn = 1, kRowEnds = 2 };
 
-// This core's dirty map, reducer-major, for the reducers of this worker's share.
 template <uint32_t cores, uint32_t total_chunks>
 inline void map_dirty(const uint8_t* dirty, uint32_t* map, uint32_t worker) {
     for (uint32_t r = share_begin(cores, worker); r < share_begin(cores, worker + 1); ++r) {
@@ -193,11 +177,7 @@ inline void map_dirty(const uint8_t* dirty, uint32_t* map, uint32_t worker) {
     }
 }
 
-// The OR of the copies pushed into this core's scratch: chunk k (natural chunk core_idx + k * cores) holds core c's
-// copy in slot k * cores + c when bit k of core c's map word for this core (column[c]) is
-// set. First each worker lists the copies of its chunks k % kWorkers == worker (lists[k * cores + i] = c,
-// copies[k] = count); then, so that a chunk every core touched is not left to one worker, every worker ORs its
-// words j % kWorkers == worker of every chunk.
+// Scratch slot k * cores + c holds core c's copy of this core's chunk k when bit k of column[c] is set.
 template <uint32_t cores>
 inline void list_copies(const uint32_t* column, uint32_t chunks, uint16_t* lists, uint32_t* copies, uint32_t worker) {
     for (uint32_t k = worker; k < chunks; k += kWorkers) {
@@ -212,6 +192,7 @@ inline void list_copies(const uint32_t* column, uint32_t chunks, uint16_t* lists
     }
 }
 
+// Split by word rather than by chunk, so a chunk every core touched is not left to one worker.
 template <uint32_t cores>
 inline void or_copies(
     const uint32_t* scratch,
@@ -248,9 +229,8 @@ inline void or_copies(
     }
 }
 
-// Ranks within block range [b0, b1) (b0 a multiple of num_devices, so block b's owner is b % num_devices), for
-// the owners o % kWorkers == worker: rank16[w] = rows of the block's owner in the range's earlier blocks plus set
-// bits before word w in its block; counts[b] = set bits of block b; partial[o] = rows of owner o in the range.
+// rank16[w]: the block owner's rows in the range before word w; counts[b]: set bits of block b; partial[o]: owner o's
+// rows in the range. b0 is a multiple of num_devices, so block b's owner is b % num_devices.
 template <uint32_t num_devices, uint32_t words_per_block>
 inline void range_ranks(
     const uint32_t* bits,
@@ -276,8 +256,7 @@ inline void range_ranks(
     }
 }
 
-// For each owner o % kWorkers == worker: its partials turned in place into exclusive prefixes over the ranges, and
-// its total over all ranges into totals[o].
+// Partials become exclusive prefixes over the ranges, in place.
 template <uint32_t num_devices>
 inline void owner_prefixes(uint32_t* partials, uint32_t ranges, uint32_t* totals, uint32_t worker) {
     for (uint32_t o = worker; o < num_devices; o += kWorkers) {
@@ -291,7 +270,6 @@ inline void owner_prefixes(uint32_t* partials, uint32_t ranges, uint32_t* totals
     }
 }
 
-// Once every total is in: the compact-buffer run base of each owner o % kWorkers == worker.
 template <uint32_t num_devices, uint32_t unit>
 inline void owner_bases(const uint32_t* totals, uint32_t* base, uint32_t worker) {
     for (uint32_t o = worker; o < num_devices; o += kWorkers) {
@@ -303,8 +281,6 @@ inline void owner_bases(const uint32_t* totals, uint32_t* base, uint32_t worker)
     }
 }
 
-// Rewrite indices [begin, end) in place to compact slots: slot = base[owner] + bank lane of the row's rank among
-// this requester's rows from that owner, rank = prefix[range][owner] + rank16[word] + set bits before the row.
 template <uint32_t num_devices, uint32_t stripe_chunk, uint32_t range_blocks, uint32_t pages_per_packet, uint32_t banks>
 inline void rewrite(
     uint32_t* __restrict__ idx,
@@ -331,7 +307,6 @@ inline void rewrite(
     }
 }
 
-// A worker's steps from the ranks on (BRISC runs the same loops between its NOC work).
 template <
     uint32_t num_devices,
     uint32_t stripe_chunk,

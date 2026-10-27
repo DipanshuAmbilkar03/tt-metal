@@ -85,8 +85,7 @@ ttnn::Tensor sparse_sdpa(
     const std::optional<GlobalSemaphore>& push_ready_semaphore = std::nullopt,
     const std::optional<GlobalSemaphore>& push_data_valid_semaphore = std::nullopt,
     const std::optional<tt::tt_metal::CoreRangeSet>& push_core_grid = std::nullopt,
-    // Trace-safe slot for the fused push: slot = push_batch_index_tensor[0] * push_batch_slot_num_layers +
-    // push_batch_slot_layer_idx, read on device (push_batch_index is then ignored).
+    // Trace-safe: slot = push_batch_index_tensor[0] * push_batch_slot_num_layers + push_batch_slot_layer_idx.
     const std::optional<ttnn::Tensor>& push_batch_index_tensor = std::nullopt,
     uint32_t push_batch_slot_num_layers = 1,
     uint32_t push_batch_slot_layer_idx = 0);

@@ -15,23 +15,13 @@
 
 namespace ttnn::operations::experimental::sparse_kv_push {
 
-// On-device plan for the sparse KV push. From one requester chip's top-k indices (natural positions in the
-// TP-deduped block-cyclic KVPE cache) it builds
-//   - the requester's plan table: which rows it needs (bitmap) plus the counts every owner and the requester itself
-//     derive the compact-buffer layout from; all-gathered, it tells each owner what to push and where; and
-//   - the indices rewritten to slots in the requester's compact buffer.
-// Natural row n lives in block n / stripe_chunk, owned by chip block % num_devices. A requester's rows from owner o
-// occupy a run starting at base(o) = sum over o' < o of round_up(count(o'), P * banks); row k of the run sits in the
-// bank lane (k / P) % banks of packet group (k / P) / banks, at offset k % P (see
-// kernels/sparse_push_table_reader.cpp).
+// Compact slots: owner o's rows start at base(o) = sum over o' < o of round_up(count(o'), P * banks). Row k sits in bank
+// lane (k / P) % banks at offset k % P, so each P-row packet is one contiguous write into a single DRAM bank.
 //
-// Table: uint32 [1, 1, pages, 1024], one 4 KiB row-major page per row. Word offsets:
-//   [0] magic, [1] num_devices, [2] stripe_chunk, [3] active blocks (later blocks are stale), [4] split block
-//   [32, 32 + num_devices)   rows this requester needs from each owner
-//   [64, 64 + num_devices)   of those, rows in blocks before the split block (the chunk start): the prefix part
-//   [128, 128 + W)           bitmap of needed rows, W = max_rows / 32
-// It holds only what the owners' push reads, since every chip all-gathers every table. The plan op's own image of it
-// carries the block counts after the bitmap (counts_off), which stay on chip.
+// Table (uint32, 4 KiB pages; every chip all-gathers every table, so it holds only what the owners read). Words:
+//   [0] magic, [1] num_devices, [2] stripe_chunk, [3] active blocks (later ones are stale), [4] split block
+//   [32 + o] rows needed from owner o;  [64 + o] of those, rows before the split block (the prefix part)
+//   [128, 128 + max_rows / 32) bitmap of needed rows
 struct SparsePushPlanLayout {
     static constexpr uint32_t kMagic = 0x5350504Cu;
     static constexpr uint32_t kOwnerOff = 32;
@@ -67,7 +57,7 @@ struct SparsePushPlanParams {
 
 struct SparsePushPlanInputs {
     Tensor indices;  // uint32 row-major [1, 1, rows, topk] per device, 0xFFFFFFFF = masked
-    // Optional 1-element uint32 DRAM tensor holding the chunk start row: rows before it are the prefix part.
+    // 1-element uint32 chunk start row: rows before it are the prefix part.
     std::optional<Tensor> chunk_start;
 };
 

@@ -26,10 +26,9 @@ def _layout(max_rows, sc):
 
 
 def _compact_reference(indices, num_devices, stripe_chunk, pages_per_packet, banks):
-    """Host reference of the plan's index rewrite. indices: [num_devices, rows, topk] natural positions (SENTINEL =
-    masked), chip-major. A requester's rows from owner o form a run starting at base(o) = sum over o' < o of
-    round_up(count(o'), P * banks), in the owner's local-row order; row k of the run is at offset k % P of packet
-    k / P, whose rows sit `banks` pages apart in bank lane (k / P) % banks."""
+    """Host reference of the plan's index rewrite (indices [num_devices, rows, topk], SENTINEL masked). Owner o's run
+    starts at sum(round_up(count(o'), P * banks) for o' < o); its row k is at offset k % P of packet k / P, in bank
+    lane (k / P) % banks."""
     unit = pages_per_packet * banks
     compact = np.full(indices.shape, SENTINEL, dtype=np.int64)
     for dest in range(num_devices):

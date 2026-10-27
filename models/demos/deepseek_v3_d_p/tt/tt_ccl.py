@@ -60,10 +60,6 @@ _SPARSE_MLA_OVERLAP_PROFILE_ALIASES = {"galaxy_rows1": "loudbox_rows1"}
 _SPARSE_MLA_OVERLAP_GATHER_ROWS = 1
 
 
-def sparse_mla_overlap_gather_rows(profile: str) -> int:  # TEMP: main test imports it but main lacks it; do not commit
-    return _SPARSE_MLA_OVERLAP_GATHER_ROWS
-
-
 def get_tt_ccl(mesh_device: ttnn.MeshDevice) -> "TT_CCL":
     """Get or create TT_CCL for mesh_device (cached per device id)."""
     mesh_id = mesh_device.id()
@@ -187,9 +183,7 @@ class TT_CCL:
         # exclusively to the SP KV-prefix gather branch and is never shared with the TP index gather.
         self.sparse_mla_overlap_resources: SparseMlaOverlapResources | None = None
 
-        # Sparse KVPE push: one planner (its plan is reused by every layer fed the same indices) and one
-        # caller-owned ready/done semaphore pair, created on first use (the warm pass, before any capture).
-        self.sparse_kv_push = None
+        self.sparse_kv_push = None  # SparseKvPushPlanner, created on first use
 
         # The routed expert / combine_fabric2d overlap's fwd_arrived, final_arrived and expert_go, shared by every
         # MoE layer. Created on first use; see get_combine_overlap_semaphores.
@@ -463,40 +457,13 @@ class TT_CCL:
         return self.mla_chunked_kv_buffers[key]
 
     def get_sparse_kv_push(self, links: int):
-        """(planner, ready_semaphore, done_semaphore) for the sparse KVPE push; layers run serially and share them."""
+        """The sparse KVPE push planner; layers run serially and share it."""
         if self.sparse_kv_push is None:
+            # Imported here: the tt.mla package imports this module.
             from models.demos.deepseek_v3_d_p.tt.mla.sparse_kv_push import SparseKvPushPlanner
 
-            l1_small = ttnn.get_memory_view(self.mesh_device, ttnn.BufferType.L1_SMALL).total_bytes_per_bank > 0
-            buffer_type = ttnn.BufferType.L1_SMALL if l1_small else ttnn.BufferType.L1
-            sems = [
-                ttnn.create_global_semaphore(self.mesh_device, self.sub_device_crs, 0, buffer_type) for _ in range(2)
-            ]
-            ttnn.synchronize_device(self.mesh_device)
-            self.sparse_kv_push = (SparseKvPushPlanner(self.mesh_device, links), *sems)
+            self.sparse_kv_push = SparseKvPushPlanner(self.mesh_device, links)
         return self.sparse_kv_push
-
-    def get_sparse_kv_push_grids(self, links: int, query_rows: int):
-        """(attention, push) core grids for sparse_sdpa with the next layer's push fused in.
-
-        Attention takes the fewest whole columns that keep its busiest core's token count minimal: cores past that
-        only add DRAM contention with the push. The push (2 senders + 1 fabric mux per link and direction) takes the
-        rows of the remaining columns furthest from the Ethernet row, where it contends less with attention.
-        """
-        grid = self.mesh_device.compute_with_storage_grid_size()
-        push_cores = links * 4 * 3
-        tokens_per_core = -(-query_rows // (grid.x * grid.y - push_cores))
-        attention_cols = -(-(-(-query_rows // tokens_per_core)) // grid.y)
-        push_cols = grid.x - attention_cols
-        push_rows = -(-push_cores // push_cols) if push_cols > 0 else grid.y + 1
-        assert push_rows <= grid.y, f"no room for {push_cores} push cores beside attention on a {grid} grid"
-        attention = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(attention_cols - 1, grid.y - 1))]
-        )
-        push = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(attention_cols, grid.y - push_rows), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
-        )
-        return attention, push
 
     def get_mla_sparse_kv_gather_buffer(self, *, seq_len, row_width, dtype, layout):
         """Return the full-capacity output scratch for sparse MLA's SP KV-prefix gather.

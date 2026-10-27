@@ -13,8 +13,8 @@ them the needed rows are known before the layer runs. The sparse KV push sends e
 ## Where it applies
 
 - Layers fed another layer's top-k indices (GLM shared layers; also GLM MTP levels after the first), on a
-  `FABRIC_2D_TORUS_XY` mesh of at least 3x3 (`sparse_kv_push_supported`). `ttMLA(sparse_kv_push=None)` picks it
-  automatically; `False` forces the dense gather (the reference in tests). Other fabrics keep the dense gather.
+  `FABRIC_2D_TORUS_XY` mesh of at least 3x3 (`sparse_kv_push_supported`). Meshes the push cannot route keep the
+  dense gather.
 - Full (indexer) layers keep the dense gather, overlapped with their top-k on sub-devices.
 
 ## Data flow
@@ -34,17 +34,18 @@ Once per set of indices (the first shared layer after a full layer, or the full 
    bitwise equal to the dense path.
 
 **Overlap with attention.** A layer whose successor reuses its indices runs `sparse_sdpa` with the successor's
-prefix push fused in (`SparseSDPAPushFusedFactory`): the push senders and muxes on the rows nearest the Ethernet row,
-attention on the rest, in one program (`TT_CCL.get_sparse_kv_push_grids`; separate from the overlap profile's
-full-layer gather grid). The prefix part holds rows written by earlier chunks; the successor then pushes the
-remainder (`part=2`, its own chunk's rows) before its attention. A shared layer nothing prefetched for pushes all its
-rows itself (`part=0`).
+prefix push fused in (`SparseSDPAPushFusedFactory`), on disjoint core grids of one program
+(`SparseKvPushPlanner.grids`). Attention takes the fewest whole columns that keep its busiest core at the fewest
+tokens (2 on 80 cores for GLM's 160 tokens per chip): more cores only add DRAM contention with the push. The push's
+24 cores take the remaining columns' rows furthest from the Ethernet row. The prefix part holds rows written by
+earlier chunks; the successor then pushes the remainder (`part=2`, its own chunk's rows) before its attention. A
+shared layer nothing prefetched for pushes all its rows itself (`part=0`).
 
-**Buffers.** A chip's distinct rows are at most its query rows x top-k, so the push buffer is sized from the chunk at
-init (`SparseKvPushPlanner.buffer_rows`; 222 MiB at a 1M cache instead of 703 MiB), not from the cache. Layer L reads
-one buffer while L+1's fills: counting from the last full layer, even layers use the dense gather buffer (idle
-outside full layers) and odd layers the push buffer. When the push buffer does not fit in the dense one (small
-caches), two push buffers alternate instead.
+**Buffers.** A chip's distinct rows are at most its query rows x top-k, so the push buffer is sized from the chunk
+at init (`SparseKvPushPlanner.buffer_rows`; about 220 MiB at a 1M cache instead of 703 MiB), not from the cache.
+Layer L reads one buffer while L+1's fills: counting from the last full layer, even layers use the dense gather
+buffer (idle outside full layers) and odd layers the push buffer. When the push buffer does not fit in the dense one
+(small caches), two push buffers alternate instead.
 
 ## Trace safety
 

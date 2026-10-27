@@ -2,12 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Route choice for the sparse KV push on a 2D torus (shared by its reader and writer, which must agree).
-// The routing tables send every ring-distance tie the same way (N, and E), overloading those links, so half of the
-// tie destinations go the other way (MESH_ROWS x MESH_COLS row-major ranks; rows are the N/S axis): a row tie leaves
-// on the opposite N/S connection (the tables lead on from the next row); a column tie leaves on the opposite E/W
-// connection when in the same row, otherwise flips the E/W action byte of the turn column (routes are Y then X, so
-// the turn is at the source column).
+// Shared by the push reader and writer, which must agree. The routing tables break every ring-distance tie the same
+// way (N, E), overloading those links, so half of the tie destinations are sent the other way round.
 
 #pragma once
 
@@ -36,6 +32,7 @@ inline Route route(uint32_t src, uint32_t dst, uint32_t table_dir) {
         if (dy == 0) {
             return {table_dir == kEast ? kWest : (table_dir == kWest ? kEast : table_dir), false};
         }
+        // Routes go Y then X, so off the source row the E/W choice is the turn at the source column.
         return {table_dir, true};
     }
     return {table_dir, false};

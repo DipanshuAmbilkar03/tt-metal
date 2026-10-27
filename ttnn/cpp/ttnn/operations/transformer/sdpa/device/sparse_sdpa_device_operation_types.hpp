@@ -13,15 +13,14 @@
 
 namespace ttnn::prim {
 
-// A sparse KV push of the next layer's prefix rows (sparse_kv_push, part 1) fused into this op: its
-// reader/writer/mux kernels run on push_core_grid, disjoint from worker_core_grid, while attention runs.
+// Pushes the next layer's prefix rows (sparse_kv_push part 1) on push_core_grid, disjoint from worker_core_grid.
 struct SparseSDPAFusedPush {
     uint32_t stripe_chunk = 0;
     uint32_t max_rows = 0;
     uint32_t num_links = 2;
-    uint32_t input_batch_index = 0;  // cache slot pushed; a runtime arg (not hashed)
-    // With push_batch_index_tensor (trace-safe), the slot is read on device as
-    // tensor[0] * batch_slot_num_layers + batch_slot_layer_idx instead; both are runtime args (not hashed).
+    // Not hashed, like the semaphores. With push_batch_index_tensor the slot is
+    // tensor[0] * batch_slot_num_layers + batch_slot_layer_idx, read on device.
+    uint32_t input_batch_index = 0;
     uint32_t batch_slot_num_layers = 1;
     uint32_t batch_slot_layer_idx = 0;
     std::optional<GlobalSemaphore> ready_semaphore;
@@ -56,12 +55,10 @@ struct SparseSDPAInputs {
     Tensor indices;  // [1, 1, S, TOPK] uint32 ROW_MAJOR  (0xFFFFFFFF = masked)
     // [1, 1, 1, H] ROW_MAJOR BF16; scaled like QK.
     std::optional<Tensor> attention_sink;
-    // Fused push (see SparseSDPAFusedPush): KVPE cache pushed from, all-gathered plan tables, and the next layer's
-    // compact buffer.
+    // Fused push only.
     std::optional<Tensor> push_input;
     std::optional<Tensor> push_table;
     std::optional<Tensor> push_output;
-    // 1-element uint32 user-slot tensor (the runner's metadata[0]); replaces input_batch_index when set.
     std::optional<Tensor> push_batch_index_tensor;
 };
 

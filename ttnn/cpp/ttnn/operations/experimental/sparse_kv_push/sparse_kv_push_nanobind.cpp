@@ -17,10 +17,9 @@ void bind_experimental_sparse_kv_push_operations(nb::module_& mod) {
     ttnn::bind_function<"sparse_kv_push", "ttnn.experimental.">(
         mod,
         R"doc(
-            Sparse KV push: instead of gathering the whole KVPE cache onto every chip, each owner chip pushes only
-            the rows of the selected cache slot that a requester's top-k references, into that requester's compact
-            ``output_tensor`` at the slots ``sparse_push_plan`` rewrote its indices to. Full mesh on a 2D torus
-            fabric (FABRIC_2D_TORUS_XY), with caller-owned semaphores.
+            Each owner chip pushes only the cache rows a requester's top-k references into that requester's
+            compact ``output_tensor``, at the slots ``sparse_push_plan`` rewrote its indices to.
+            Needs a FABRIC_2D_TORUS_XY fabric.
 
             Args:
                 input_tensor: The KVPE cache, sharded over its rows (dim 2) across every chip.
