@@ -211,6 +211,11 @@ pb::CacheLayoutModel to_proto_message(const CacheLayoutModel& model) {
         for (uint32_t layer : cache.layers) {
             c.add_layers(layer);
         }
+        c.set_first_layer(cache.first_layer);
+        c.set_num_layers(cache.num_layers);
+        if (cache.mesh_id.has_value()) {
+            c.set_mesh_id(**cache.mesh_id);
+        }
     }
     out.set_mesh_id(*model.mesh_id);
     for (size_t i = 0; i < model.mesh_shape.dims(); ++i) {
@@ -242,7 +247,11 @@ CacheLayoutModel from_proto_message(const pb::CacheLayoutModel& in) {
             .policy = from_proto(c.policy()),
             .base_addr = c.base_addr(),
             .name = c.name(),
-            .layers = to_vector(c.layers())});
+            .layers = to_vector(c.layers()),
+            .first_layer = c.first_layer(),
+            .num_layers = c.num_layers(),
+            .mesh_id = c.has_mesh_id() ? std::optional<tt::tt_fabric::MeshId>(tt::tt_fabric::MeshId{c.mesh_id()})
+                                       : std::nullopt});
     }
     model.mesh_id = tt::tt_fabric::MeshId{in.mesh_id()};
     const std::vector<uint32_t> mesh_shape = to_vector(in.mesh_shape());

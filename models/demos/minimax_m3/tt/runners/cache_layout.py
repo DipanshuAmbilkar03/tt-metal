@@ -3,10 +3,10 @@
 
 """The MiniMax-M3 prefill caches declared as a ``CacheLayoutModel`` (the cache tensor layout spec).
 
-Each cache is a ``CacheConfig``: the tensor's ``KvLayoutSpec`` (its logical shape, dtype and DRAM ND-shard
-spec, and how its sequence is retained), the mesh distribution its chunks really have, and the writer's
-``GenerationPolicy``. ``ttnn.experimental.disaggregation.to_chunk_map`` derives the KV chunk address table
-from the model, so ``kv_chunk_table.py`` does not have to replay the writer's bank walk itself.
+Each cache of each pipeline stage is a ``CacheConfig``: the tensor's ``KvLayoutSpec`` (its logical shape,
+dtype and DRAM ND-shard spec, and how its sequence is retained), the mesh distribution its chunks really
+have, the writer's ``GenerationPolicy``, and the stage's mesh, layer range and base address.
+``ttnn.experimental.disaggregation.to_chunk_map`` derives the KV chunk address table from the model.
 
 The allocated tensors carry a 1-D Replicate topology (which head or sequence block a chip holds is decided
 at write time), so the distribution is declared here instead:
@@ -15,25 +15,35 @@ at write time), so the distribution is declared here instead:
     configs N..2N-1   v head h:   likewise
     config  2N        index_k:    the sequence sharded over the SP rows, replicated over the TP columns
 
-Every cache is ``[num_users * num_layers, 1, seq_len, head_dim]``, user-major, so ``to_chunk_map`` folds
-the layers into its batch axis. The writer's layout is the Natural scheme with the Identity bank order:
-32-token blocks round-robin over the banks, and SP row r owning ``[n*chunk + r*chunk/sp, +chunk/sp)`` of
-each prefill chunk n (chunk-modulo ownership with ``device_chunk_size = chunk/sp``).
+A stage's caches are ``[num_users * stage_layers, 1, seq_len, head_dim]``, user-major, so ``to_chunk_map``
+folds the stage's layers into the batch axis. The writer's layout is the Natural scheme with the Identity
+bank order: 32-token blocks round-robin over the banks, and SP row r owning ``[n*chunk + r*chunk/sp,
++chunk/sp)`` of each prefill chunk n (chunk-modulo ownership with ``device_chunk_size = chunk/sp``).
 """
 
 import ttnn
-from models.demos.minimax_m3.tt.attention.kv_cache import NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK, cache_memory_config
+from models.demos.minimax_m3.tt.attention.kv_cache import (
+    BH_NUM_DRAM_BANKS,
+    NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK,
+    cache_memory_config,
+)
 
 disaggregation = ttnn.experimental.disaggregation
 
 # The model is written next to the table it derives: ``<table path><LAYOUT_MODEL_SUFFIX>``.
 LAYOUT_MODEL_SUFFIX = ".cache_layout.pb"
+# The cache's ND-shard grid is the BH_NUM_DRAM_BANKS Blackhole DRAM banks.
+CACHE_ARCH = ttnn.device.Arch.BLACKHOLE
 
 
-def _spec(tensor, *, num_users, num_layers, seq_len, head_dim, arch):
-    shape = ttnn.Shape([num_users * num_layers, 1, seq_len, head_dim])
-    tensor_spec = ttnn.TensorSpec(shape, tensor.dtype, ttnn.TILE_LAYOUT, cache_memory_config(head_dim))
-    return disaggregation.KvLayoutSpec(tensor_spec, disaggregation.TemporalDense(), arch)
+class CacheLayoutNotDerivable(Exception):
+    """The caches' layout is one the CacheLayoutModel cannot yet declare."""
+
+
+def _spec(dtype, *, num_users, stage_layers, seq_len, head_dim):
+    shape = ttnn.Shape([num_users * stage_layers, 1, seq_len, head_dim])
+    tensor_spec = ttnn.TensorSpec(shape, dtype, ttnn.TILE_LAYOUT, cache_memory_config(head_dim))
+    return disaggregation.KvLayoutSpec(tensor_spec, disaggregation.TemporalDense(), CACHE_ARCH)
 
 
 def _head_topology(sp, head):
@@ -49,28 +59,44 @@ def _replicated_topology(sp, cols):
     return ttnn.TensorTopology(shape, [ttnn.PlacementShard(2), ttnn.PlacementReplicate()], coords)
 
 
+def _stage_mesh_id(stage, sp, cols):
+    """The stage's mesh, whose chips its fabric node ids must number row-major as to_chunk_map does."""
+    fnids = stage["fnids"]
+    mesh_id = int(fnids[0][0].mesh_id)
+    for r in range(sp):
+        for c in range(cols):
+            if (int(fnids[r][c].mesh_id), int(fnids[r][c].chip_id)) != (mesh_id, r * cols + c):
+                raise CacheLayoutNotDerivable(
+                    f"stage at layer {stage['first_layer']} numbers its chips other than row-major over its mesh"
+                )
+    return ttnn.MeshId(mesh_id)
+
+
 def m3_cache_layout_model(
     *,
     kv_cache,
-    base_addrs,
-    mesh_id,
-    mesh_shape,
-    arch,
+    stage_layouts,
+    sp,
+    cols,
     num_users,
-    num_layers,
     seq_len,
     chunk_size,
     num_kv_heads,
     head_dim,
     index_k_layers=None,
 ):
-    """The ``CacheLayoutModel`` of ``kv_cache`` on one mesh with the sequence on its rows (``sp_axis == 0``)
-    and index_k TP-replicated. ``base_addrs`` is the (k, v, index_k) buffer address, identical on every
-    chip; ``index_k_layers`` limits index_k's rows to those layers (the MSA layers), as the decode peer
-    holds index_k only there. Config names are the zero-padded positions the decode table uses."""
+    """The ``CacheLayoutModel`` of the M3 prefill caches over ``stage_layouts`` (one layout per cache — k,
+    v, index_k — each a list of pipeline stages with ``first_layer``, ``count``, ``base_addr``,
+    ``num_banks`` and ``fnids[row][col]``; a single rank is one stage). ``index_k_layers`` limits index_k's
+    rows to those model layers (the MSA layers), as the decode peer holds index_k only there. Config names
+    are the zero-padded positions the decode table uses.
+
+    Raises CacheLayoutNotDerivable for a TP-deduped index_k (its sequence is sharded over both mesh axes),
+    a stage whose chips are not numbered row-major, or a bank count other than the cache's."""
     from models.demos.minimax_m3.tt.runners.kv_chunk_table import config_name
 
-    sp, cols = mesh_shape
+    if getattr(kv_cache, "index_k_tp_axis", None) is not None:
+        raise CacheLayoutNotDerivable("a TP-deduped index_k shards its sequence over both mesh axes")
     assert num_kv_heads == cols, f"num_kv_heads ({num_kv_heads}) must equal the TP column count ({cols})"
     policy = disaggregation.GenerationPolicy(
         bank_scheme=disaggregation.BankScheme.Natural,
@@ -79,30 +105,37 @@ def m3_cache_layout_model(
         k_chunk_size=NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK,
         device_chunk_size=chunk_size // sp,
     )
-    shape_args = dict(num_users=num_users, num_layers=num_layers, seq_len=seq_len, head_dim=head_dim, arch=arch)
-    k_base, v_base, index_k_base = base_addrs
     num_configs = 2 * num_kv_heads + 1
+    # (cache index into stage_layouts, dtype, topology) per config, in config-id order.
+    configs = [(0, kv_cache.k.dtype, _head_topology(sp, h)) for h in range(num_kv_heads)]
+    configs += [(1, kv_cache.v.dtype, _head_topology(sp, h)) for h in range(num_kv_heads)]
+    configs.append((2, kv_cache.index_k.dtype, _replicated_topology(sp, cols)))
+    index_k_published = sorted(index_k_layers) if index_k_layers is not None else []
 
     caches = []
-    for tensor, base in ((kv_cache.k, k_base), (kv_cache.v, v_base)):
-        spec = _spec(tensor, **shape_args)
-        for head in range(num_kv_heads):
+    for config_id, (cache_idx, dtype, topology) in enumerate(configs):
+        is_index_k = cache_idx == 2
+        for stage in stage_layouts[cache_idx]:
+            if stage["num_banks"] != BH_NUM_DRAM_BANKS:
+                raise CacheLayoutNotDerivable(
+                    f"stage at layer {stage['first_layer']} has {stage['num_banks']} DRAM banks, "
+                    f"not the cache's {BH_NUM_DRAM_BANKS}"
+                )
             caches.append(
                 disaggregation.CacheConfig(
-                    spec, _head_topology(sp, head), policy, base, config_name(len(caches), num_configs)
+                    _spec(dtype, num_users=num_users, stage_layers=stage["count"], seq_len=seq_len, head_dim=head_dim),
+                    topology,
+                    policy,
+                    stage["base_addr"],
+                    name=config_name(config_id, num_configs),
+                    layers=index_k_published if is_index_k else [],
+                    first_layer=stage["first_layer"],
+                    num_layers=stage["count"],
+                    mesh_id=_stage_mesh_id(stage, sp, cols),
                 )
             )
-    caches.append(
-        disaggregation.CacheConfig(
-            _spec(kv_cache.index_k, **shape_args),
-            _replicated_topology(sp, cols),
-            policy,
-            index_k_base,
-            config_name(len(caches), num_configs),
-            sorted(index_k_layers) if index_k_layers is not None else [],
-        )
-    )
+    num_layers = sum(stage["count"] for stage in stage_layouts[0])
     geometry = disaggregation.MapGeometry(
         num_layers, num_users, seq_len, position_step=NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
     )
-    return disaggregation.CacheLayoutModel(caches, mesh_id, ttnn.MeshShape(sp, cols), geometry)
+    return disaggregation.CacheLayoutModel(caches, caches[0].mesh_id, ttnn.MeshShape(sp, cols), geometry)

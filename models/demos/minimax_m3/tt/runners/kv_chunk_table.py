@@ -30,18 +30,29 @@ The per-chip DRAM addressing (32-token blocks round-robin across the DRAM banks,
 user-major ``slot*num_layers+layer`` fold) matches DeepSeek's ``create_kv_chunk_address_table_block_cyclic``, just
 repeated per config with each tensor's own ``buffer_address()`` / ``chunk_size_bytes`` and column set.
 
-On one mesh with index_k TP-replicated, the table is derived from the caches' declared layout instead
-(``cache_layout.py``), and that ``CacheLayoutModel`` is written next to the table for a consumer that derives
-the table itself. The pipeline-parallel merge and a TP-deduped index_k keep the walk below.
+The caches' declared layout (``cache_layout.py``, a ``CacheLayoutModel`` over the same stages) derives the
+same table with ``to_chunk_map``. Until that replaces the walk (``M3_KV_TABLE_FROM_LAYOUT_MODEL=1``), the walked
+table is published and the derived one is checked against it; the model is written next to the table
+(``<path>.cache_layout.pb``), for a consumer that derives the table itself, only when the two agree.
 """
 
+import os
 import socket
 
 from loguru import logger
 
 import ttnn
 from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
-from models.demos.minimax_m3.tt.runners.cache_layout import LAYOUT_MODEL_SUFFIX, m3_cache_layout_model
+from models.demos.minimax_m3.tt.runners.cache_layout import (
+    LAYOUT_MODEL_SUFFIX,
+    CacheLayoutNotDerivable,
+    m3_cache_layout_model,
+)
+
+disaggregation = ttnn.experimental.disaggregation
+
+# Set to 1 to publish the table derived from the caches' CacheLayoutModel without walking the classic one.
+LAYOUT_MODEL_ENV = "M3_KV_TABLE_FROM_LAYOUT_MODEL"
 
 # bf8_b / bf16 TILE byte sizes (32x32 tile). bf8_b = 1024 mantissa + 64 exponent bytes; bf16 = 2048.
 _TILE_BYTES = {ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}
@@ -75,44 +86,39 @@ def _make_config(*, num_layers, max_seq_len, num_users, chunk_size_bytes):
     return cfg
 
 
-def _single_mesh_fabric_node_ids(mesh_device, sp, cols):
-    """This mesh's fabric node ids by (SP row, TP column), if they number its chips row-major as
-    ``to_chunk_map`` does; else None."""
-    fnids = [[mesh_device.get_fabric_node_id(ttnn.MeshCoordinate(r, c)) for c in range(cols)] for r in range(sp)]
-    mesh_id = fnids[0][0].mesh_id
-    row_major = all(
-        int(fnids[r][c].mesh_id) == int(mesh_id) and int(fnids[r][c].chip_id) == r * cols + c
-        for r in range(sp)
-        for c in range(cols)
-    )
-    return fnids if row_major else None
+def _host_name(stage):
+    """The gathered layout carries a per-host crc32 tag (allgather_int can't move strings); the single-rank
+    synthesized stage carries the real local hostname instead."""
+    return stage.get("host_name") or f"host-{stage['host_tag']:08x}"
 
 
-def _export_from_layout_model(*, mesh_device, kv_cache, fnids, sp, cols, path, **model_args):
-    """Derive the table from the caches' CacheLayoutModel, write the model to ``path +
-    LAYOUT_MODEL_SUFFIX`` and the table to ``path``."""
-    model = m3_cache_layout_model(
-        kv_cache=kv_cache,
-        base_addrs=tuple(int(t.buffer_address()) for t in (kv_cache.k, kv_cache.v, kv_cache.index_k)),
-        mesh_id=fnids[0][0].mesh_id,
-        mesh_shape=(sp, cols),
-        arch=mesh_device.arch(),
-        **model_args,
-    )
-    table = ttnn.experimental.disaggregation.to_chunk_map(model)
-    host_name = socket.gethostname()
-    for row in fnids:
-        for fid in row:
-            table.set_fabric_node_host(fid, host_name=host_name)
+def _derived_table(model, stage_layouts):
+    """The table to_chunk_map derives from ``model``, with every stage's chips on its host."""
+    table = disaggregation.to_chunk_map(model)
+    for layout in stage_layouts:
+        for stage in layout:
+            for row in stage["fnids"]:
+                for fid in row:
+                    table.set_fabric_node_host(fid, host_name=_host_name(stage))
+    return table
+
+
+def _check_layout_model(walked, model, not_derivable, stage_layouts, path):
+    """Checks the table derived from the caches' layout model against the walked one, and writes the model
+    next to the table only when they agree."""
+    if model is None:
+        logger.info(f"[migration] M3 cache layout model not derived ({not_derivable}); the walked table stands alone")
+        return
+    difference = disaggregation.first_table_difference(walked, _derived_table(model, stage_layouts))
+    if difference is not None:
+        logger.error(
+            f"[migration] the KV chunk table derived from the M3 cache layout model differs from the walked "
+            f"table at {difference}; publishing the walked table without the model"
+        )
+        return
     model_path = path + LAYOUT_MODEL_SUFFIX
-    ttnn.experimental.disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
-    ttnn.experimental.disaggregation.export_to_protobuf_file(table, path)
-    logger.info(
-        f"[migration] M3 KV chunk address table derived from its cache layout model ({model_path}) and "
-        f"serialized to {path} (configs={len(model.caches)}, layers={model.geometry.num_layers}, "
-        f"entries={table.total_entries()}, index_k=TP-replicated ({cols}-chip groups))"
-    )
-    return path
+    disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
+    logger.info(f"[migration] the M3 cache layout model derives the walked KV chunk table; wrote it to {model_path}")
 
 
 def build_and_serialize_kv_chunk_table(
@@ -201,29 +207,6 @@ def build_and_serialize_kv_chunk_table(
             f"{NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK}-token chunks"
         )
 
-    if stage_layouts is None and sp_axis == 0 and not index_k_tp_sharded:
-        fnids = _single_mesh_fabric_node_ids(mesh_device, sp, cols)
-        if fnids is not None:
-            return _export_from_layout_model(
-                mesh_device=mesh_device,
-                kv_cache=kv_cache,
-                fnids=fnids,
-                sp=sp,
-                cols=cols,
-                path=path,
-                num_users=num_users,
-                num_layers=num_layers,
-                seq_len=seq_len,
-                chunk_size=chunk_size,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                index_k_layers=index_k_layers,
-            )
-        logger.warning(
-            "[migration] this mesh's fabric chip ids are not row-major, so the M3 KV chunk table is walked "
-            "instead of derived from its cache layout model"
-        )
-
     if stage_layouts is None:
         # Single-rank: synthesize one one-stage layout per cache from the local mesh so both paths
         # share the build loop below. base_addr identical on every chip of the mesh (each cache is
@@ -265,6 +248,36 @@ def build_and_serialize_kv_chunk_table(
                 f"space, so kv_migration_stages must report the same range for all three."
             )
 
+    model, not_derivable = None, None
+    try:
+        model = m3_cache_layout_model(
+            kv_cache=kv_cache,
+            stage_layouts=stage_layouts,
+            sp=sp,
+            cols=cols,
+            num_users=num_users,
+            seq_len=seq_len,
+            chunk_size=chunk_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            index_k_layers=index_k_layers,
+        )
+    except CacheLayoutNotDerivable as error:
+        not_derivable = str(error)
+    if os.getenv(LAYOUT_MODEL_ENV) == "1":
+        if model is None:
+            raise RuntimeError(f"{LAYOUT_MODEL_ENV}=1, but the M3 cache layout model is not derivable: {not_derivable}")
+        model_path = path + LAYOUT_MODEL_SUFFIX
+        disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
+        table = _derived_table(model, stage_layouts)
+        disaggregation.export_to_protobuf_file(table, path)
+        logger.info(
+            f"[migration] M3 KV chunk address table derived from its cache layout model ({model_path}) and "
+            f"serialized to {path} (configs={table.num_configs()}, stages={len(stage_layouts[0])}, "
+            f"layers={total_layers}, entries={table.total_entries()})"
+        )
+        return path
+
     table = ttnn.experimental.disaggregation.KvChunkAddressTable(
         {
             config_name(i, len(specs)): _make_config(
@@ -287,9 +300,7 @@ def build_and_serialize_kv_chunk_table(
         for stage in stage_layouts[tensor_idx]:
             base_addr = stage["base_addr"]
             num_banks = stage["num_banks"]
-            # The gathered layout carries a per-host crc32 tag (allgather_int can't move strings); the
-            # single-rank synthesized stage carries the real local hostname instead.
-            host_name = stage.get("host_name") or f"host-{stage['host_tag']:08x}"
+            host_name = _host_name(stage)
             first = stage["first_layer"]
             filter_layers = label == "index_k" and index_k_layers is not None
             for global_row in range(sp):
@@ -338,6 +349,7 @@ def build_and_serialize_kv_chunk_table(
                                     if curr_bank_id == 0:
                                         curr_bank_offset += chunk_bytes
 
+    _check_layout_model(table, model, not_derivable, stage_layouts, path)
     ttnn.experimental.disaggregation.export_to_protobuf_file(table, path)
     logger.info(
         f"[migration] M3 KV chunk address table serialized to {path} "

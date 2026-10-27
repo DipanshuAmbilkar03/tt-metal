@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 
-"""Device-free checks that the M3 KV chunk table derived from the caches' declared layout
-(``CacheLayoutModel``, ``to_chunk_map``) is the table the prefill writer's bank walk gives.
+"""Device-free checks of the M3 caches' declared layout (``CacheLayoutModel``) against the classic table.
 
-``build_and_serialize_kv_chunk_table`` derives the single-mesh table from the layout model; handing it the
-same mesh as a one-stage ``stage_layouts`` makes it walk instead. The two tables must agree on every
-(config, layer, slot, position): address, size and device group. The layout model written next to the
-table must derive the same table again.
+``build_and_serialize_kv_chunk_table`` publishes the walked table, derives the same table from the caches'
+layout model with ``to_chunk_map``, and writes the model next to the table only when the two agree, on one
+mesh and across pipeline stages on their own meshes. With ``M3_KV_TABLE_FROM_LAYOUT_MODEL=1`` it publishes
+the derived table instead, which must equal the walked one.
 """
 
 import os
@@ -17,61 +16,66 @@ from types import SimpleNamespace
 import pytest
 
 import ttnn
-from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
+from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS
+from models.demos.minimax_m3.tt.runners import kv_chunk_table
 from models.demos.minimax_m3.tt.runners.cache_layout import LAYOUT_MODEL_SUFFIX
-from models.demos.minimax_m3.tt.runners.kv_chunk_table import build_and_serialize_kv_chunk_table
+from models.demos.minimax_m3.tt.runners.kv_chunk_table import LAYOUT_MODEL_ENV, build_and_serialize_kv_chunk_table
 
 disaggregation = ttnn.experimental.disaggregation
 
 SP = 2
 COLS = 4  # == num_kv_heads
-CHUNK_SIZE = 128  # chunk_local = 64: two DRAM blocks per SP row per prefill chunk
-SEQ_LEN = 256
+CHUNK_SIZE = 256  # chunk_local = 128: four DRAM blocks per SP row, one per column when index_k is TP-deduped
+SEQ_LEN = 512
 NUM_USERS = 2
-NUM_LAYERS = 4
 HEAD_DIM = 128
+ONE_MESH = (4,)  # layers per stage
+TWO_STAGES = (2, 3)
 INDEX_K_LAYERS = [1, 3]
-BASES = (0x10000, 0x80000, 0xF0000)  # k, v, index_k
 
 
-def _mesh_device(chip_id):
+def _fnids(mesh_id, chip_id=lambda r, c: r * COLS + c):
+    return [[ttnn.FabricNodeId(ttnn.MeshId(mesh_id), chip_id(r, c)) for c in range(COLS)] for r in range(SP)]
+
+
+def _stage_layouts(stage_counts, chip_id=lambda r, c: r * COLS + c):
+    """One layout per cache (k, v, index_k), each spanning the stages; every (stage, cache) has its own base
+    address, and stage i is on mesh i."""
+    layouts = []
+    for cache_idx in range(3):
+        stages, first = [], 0
+        for i, count in enumerate(stage_counts):
+            stages.append(
+                {
+                    "first_layer": first,
+                    "count": count,
+                    "base_addr": 0x10000 * (i + 1) + cache_idx * 0x4000,
+                    "num_banks": BH_NUM_DRAM_BANKS,
+                    "host_name": f"stage-{i}" if len(stage_counts) > 1 else socket.gethostname(),
+                    "fnids": _fnids(i, chip_id),
+                }
+            )
+            first += count
+        layouts.append(stages)
+    return layouts
+
+
+def _stub_cache(stage_layers, index_k_tp_axis=None):
+    def t(dtype):
+        return SimpleNamespace(shape=(NUM_USERS * stage_layers, 1, SEQ_LEN, HEAD_DIM), dtype=dtype)
+
     return SimpleNamespace(
-        get_fabric_node_id=lambda coord: ttnn.FabricNodeId(ttnn.MeshId(0), chip_id(coord[0], coord[1])),
-        arch=lambda: ttnn.device.Arch.BLACKHOLE,
+        k=t(ttnn.bfloat8_b), v=t(ttnn.bfloat8_b), index_k=t(ttnn.bfloat8_b), index_k_tp_axis=index_k_tp_axis
     )
 
 
-def _stub_cache():
-    def t(base):
-        return SimpleNamespace(
-            shape=(NUM_USERS * NUM_LAYERS, 1, SEQ_LEN, HEAD_DIM), dtype=ttnn.bfloat8_b, buffer_address=lambda: base
-        )
-
-    return SimpleNamespace(k=t(BASES[0]), v=t(BASES[1]), index_k=t(BASES[2]), index_k_tp_axis=None)
-
-
-def _build(path, mesh_device, *, walked=False):
-    stage_layouts = None
-    if walked:
-        fnids = [[mesh_device.get_fabric_node_id((r, c)) for c in range(COLS)] for r in range(SP)]
-        stage_layouts = [
-            [
-                {
-                    "first_layer": 0,
-                    "count": NUM_LAYERS,
-                    "base_addr": base,
-                    "num_banks": BH_NUM_DRAM_BANKS,
-                    "host_name": socket.gethostname(),
-                    "fnids": fnids,
-                }
-            ]
-            for base in BASES
-        ]
+def _build(path, stage_layouts, *, index_k_tp_axis=None):
+    first_stage = stage_layouts[0][0]["count"]
     build_and_serialize_kv_chunk_table(
-        mesh_device=mesh_device,
-        kv_cache=_stub_cache(),
+        mesh_device=None,
+        kv_cache=_stub_cache(first_stage, index_k_tp_axis),
         seq_len=SEQ_LEN,
-        num_layers=NUM_LAYERS,
+        num_layers=first_stage,
         mesh_shape=(SP, COLS),
         sp_axis=0,
         num_users=NUM_USERS,
@@ -85,64 +89,78 @@ def _build(path, mesh_device, *, walked=False):
     return disaggregation.import_from_protobuf_file(path)
 
 
-def _cells(table):
-    """Every (config, layer, slot, position) -> (noc_addr, size_bytes, device group)."""
-    cells = {}
-    for config_id in range(table.num_configs()):
-        name = table.config_name(config_id)
-        for layer in range(NUM_LAYERS):
-            for slot in range(NUM_USERS):
-                for position in range(0, SEQ_LEN, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK):
-                    location = table.lookup(layer, position, slot, config_id)
-                    group = table.get_device_group(location.device_group_index).fabric_node_ids
-                    if location.size_bytes == 0:
-                        group = []
-                    cells[(name, layer, slot, position)] = (
-                        location.noc_addr,
-                        location.size_bytes,
-                        sorted((int(f.mesh_id), int(f.chip_id)) for f in group),
-                    )
-    return cells
+def _derives(model_path, table):
+    """None when the model at ``model_path``, with the stages' hosts, derives ``table``."""
+    model = disaggregation.import_cache_layout_model_from_protobuf_file(model_path)
+    derived = disaggregation.to_chunk_map(model)
+    for mesh_id in range(len({int(cache.mesh_id) for cache in model.caches})):
+        for row in _fnids(mesh_id):
+            for fid in row:
+                derived.set_fabric_node_host(fid, host_name=table.get_host(fid))
+    return disaggregation.first_table_difference(table, derived)
 
 
-@pytest.fixture(scope="module")
-def tables(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("m3_layout")
-    mesh_device = _mesh_device(lambda r, c: r * COLS + c)
-    derived_path = os.path.join(str(directory), "derived.pb")
-    derived = _build(derived_path, mesh_device)
-    walked = _build(os.path.join(str(directory), "walked.pb"), mesh_device, walked=True)
-    return SimpleNamespace(derived=derived, walked=walked, model_path=derived_path + LAYOUT_MODEL_SUFFIX)
+@pytest.mark.parametrize("stage_counts", [ONE_MESH, TWO_STAGES], ids=["one_mesh", "two_stages"])
+def test_the_model_derives_the_walked_table(tmp_path, monkeypatch, stage_counts):
+    monkeypatch.delenv(LAYOUT_MODEL_ENV, raising=False)
+    path = os.path.join(str(tmp_path), "table.pb")
+    walked = _build(path, _stage_layouts(stage_counts))
+    model_path = path + LAYOUT_MODEL_SUFFIX
+    assert os.path.exists(model_path)
+    assert _derives(model_path, walked) is None
+
+    model = disaggregation.import_cache_layout_model_from_protobuf_file(model_path)
+    names = [f"{i:02d}" for i in range(2 * COLS + 1)]
+    assert [cache.name for cache in model.caches] == [name for name in names for _ in stage_counts]
+    assert [
+        (cache.first_layer, cache.num_layers, int(cache.mesh_id)) for cache in model.caches[: len(stage_counts)]
+    ] == [(sum(stage_counts[:i]), count, i) for i, count in enumerate(stage_counts)]
+    assert all(cache.layers == INDEX_K_LAYERS for cache in model.caches if cache.name == names[-1])
+    assert model.geometry.num_layers == sum(stage_counts)
 
 
-def test_the_derived_table_is_the_walked_table(tables):
-    assert [tables.derived.config_name(i) for i in range(tables.derived.num_configs())] == [
-        f"{i:02d}" for i in range(2 * COLS + 1)
-    ]
-    derived = _cells(tables.derived)
-    assert derived == _cells(tables.walked)
-    published = {layer for (name, layer, _, _), (_, size, _) in derived.items() if name == "08" and size}
-    assert published == set(INDEX_K_LAYERS)
-
-
-def test_the_layout_model_next_to_the_table_derives_it(tables):
-    model = disaggregation.import_cache_layout_model_from_protobuf_file(tables.model_path)
-    assert [cache.name for cache in model.caches] == [f"{i:02d}" for i in range(2 * COLS + 1)]
-    assert model.caches[-1].layers == INDEX_K_LAYERS
-    assert all(cache.layers == [] for cache in model.caches[:-1])
-    assert [cache.base_addr for cache in model.caches] == [BASES[0]] * COLS + [BASES[1]] * COLS + [BASES[2]]
-    assert (model.geometry.num_layers, model.geometry.num_slots, model.geometry.max_seq_len) == (
-        NUM_LAYERS,
-        NUM_USERS,
-        SEQ_LEN,
+def test_a_model_that_derives_another_table_is_not_written(tmp_path, monkeypatch):
+    monkeypatch.delenv(LAYOUT_MODEL_ENV, raising=False)
+    model_for = kv_chunk_table.m3_cache_layout_model
+    # Declares a prefill chunk twice the writer's, so every SP row owns the wrong positions.
+    monkeypatch.setattr(
+        kv_chunk_table,
+        "m3_cache_layout_model",
+        lambda **kwargs: model_for(**{**kwargs, "chunk_size": 2 * kwargs["chunk_size"]}),
     )
-    assert model.caches[0].policy.device_chunk_size == CHUNK_SIZE // SP
-    assert _cells(disaggregation.to_chunk_map(model)) == _cells(tables.derived)
-
-
-def test_a_mesh_numbered_column_major_keeps_the_walk(tmp_path):
-    mesh_device = _mesh_device(lambda r, c: c * SP + r)
-    path = os.path.join(str(tmp_path), "column_major.pb")
-    walked = _build(path, mesh_device)
+    path = os.path.join(str(tmp_path), "table.pb")
+    walked = _build(path, _stage_layouts(TWO_STAGES))
     assert not os.path.exists(path + LAYOUT_MODEL_SUFFIX)
-    assert _cells(walked) == _cells(_build(os.path.join(str(tmp_path), "walked.pb"), mesh_device, walked=True))
+    assert walked.num_configs() == 2 * COLS + 1
+
+
+@pytest.mark.parametrize(
+    "stage_layouts, index_k_tp_axis",
+    [
+        (_stage_layouts(TWO_STAGES, chip_id=lambda r, c: c * SP + r), None),
+        (_stage_layouts(TWO_STAGES), 1),
+    ],
+    ids=["column_major_mesh", "tp_deduped_index_k"],
+)
+def test_a_layout_the_model_cannot_declare_keeps_the_walk(tmp_path, monkeypatch, stage_layouts, index_k_tp_axis):
+    monkeypatch.delenv(LAYOUT_MODEL_ENV, raising=False)
+    path = os.path.join(str(tmp_path), "table.pb")
+    _build(path, stage_layouts, index_k_tp_axis=index_k_tp_axis)
+    assert os.path.exists(path)
+    assert not os.path.exists(path + LAYOUT_MODEL_SUFFIX)
+
+
+def test_publishing_the_derived_table_gives_the_walked_one(tmp_path, monkeypatch):
+    monkeypatch.delenv(LAYOUT_MODEL_ENV, raising=False)
+    walked = _build(os.path.join(str(tmp_path), "walked.pb"), _stage_layouts(TWO_STAGES))
+    monkeypatch.setenv(LAYOUT_MODEL_ENV, "1")
+    path = os.path.join(str(tmp_path), "derived.pb")
+    derived = _build(path, _stage_layouts(TWO_STAGES))
+    assert disaggregation.first_table_difference(walked, derived) is None
+    assert os.path.exists(path + LAYOUT_MODEL_SUFFIX)
+
+
+def test_publishing_the_derived_table_refuses_a_layout_the_model_cannot_declare(tmp_path, monkeypatch, expect_error):
+    monkeypatch.setenv(LAYOUT_MODEL_ENV, "1")
+    with expect_error(RuntimeError, "not derivable"):
+        _build(os.path.join(str(tmp_path), "table.pb"), _stage_layouts(TWO_STAGES), index_k_tp_axis=1)

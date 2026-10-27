@@ -143,7 +143,10 @@ void bind_cache_layout_api(nb::module_& mod) {
     nb::class_<CacheConfig>(mod, "CacheConfig", R"(
         One co-resident cache to address: its KvLayoutSpec, the mesh distribution its chunks really have
         (TensorTopology), its GenerationPolicy and buffer address, its table config name (empty => its
-        index; all empty or all set) and the layers it publishes (ascending; empty => every layer).
+        index; all empty or all set), the layers it publishes (ascending; empty => every layer it holds),
+        the model layers [first_layer, first_layer + num_layers) it holds (num_layers 0 => through the
+        last), and its mesh (None => the model's). Caches sharing a name are one table config, one per
+        pipeline stage.
     )")
         .def(
             "__init__",
@@ -153,27 +156,39 @@ void bind_cache_layout_api(nb::module_& mod) {
                const GenerationPolicy& policy,
                uint64_t base_addr,
                const std::string& name,
-               const std::vector<uint32_t>& layers) {
+               const std::vector<uint32_t>& layers,
+               uint32_t first_layer,
+               uint32_t num_layers,
+               std::optional<tt::tt_fabric::MeshId> mesh_id) {
                 new (t) CacheConfig{
                     .spec = spec,
                     .topology = topology,
                     .policy = policy,
                     .base_addr = base_addr,
                     .name = name,
-                    .layers = layers};
+                    .layers = layers,
+                    .first_layer = first_layer,
+                    .num_layers = num_layers,
+                    .mesh_id = mesh_id};
             },
             nb::arg("spec"),
             nb::arg("topology"),
             nb::arg("policy"),
             nb::arg("base_addr"),
             nb::arg("name") = "",
-            nb::arg("layers") = std::vector<uint32_t>{})
+            nb::arg("layers") = std::vector<uint32_t>{},
+            nb::arg("first_layer") = 0,
+            nb::arg("num_layers") = 0,
+            nb::arg("mesh_id") = nb::none())
         .def_rw("spec", &CacheConfig::spec)
         .def_rw("topology", &CacheConfig::topology)
         .def_rw("policy", &CacheConfig::policy)
         .def_rw("base_addr", &CacheConfig::base_addr)
         .def_rw("name", &CacheConfig::name)
-        .def_rw("layers", &CacheConfig::layers);
+        .def_rw("layers", &CacheConfig::layers)
+        .def_rw("first_layer", &CacheConfig::first_layer)
+        .def_rw("num_layers", &CacheConfig::num_layers)
+        .def_rw("mesh_id", &CacheConfig::mesh_id);
 
     nb::class_<MapGeometry>(mod, "MapGeometry", "The (layer, slot, position) grid a table is enumerated over.")
         .def(
@@ -221,6 +236,16 @@ void bind_cache_layout_api(nb::module_& mod) {
         nb::overload_cast<const CacheLayoutModel&>(&to_chunk_map),
         nb::arg("model"),
         "Derive the KvChunkAddressTable of a CacheLayoutModel.");
+    mod.def(
+        "first_table_difference",
+        &first_table_difference,
+        nb::arg("expected"),
+        nb::arg("actual"),
+        R"(
+        The first way `actual` differs from `expected` as a description, or None when they agree: the same
+        configs and, at every (config, layer, slot, position), the same address, size, device-group members
+        and members' hosts. Device-group indices are not compared.
+        )");
     mod.def(
         "export_cache_layout_model_to_protobuf_file",
         nb::overload_cast<const CacheLayoutModel&, const std::string&>(&export_to_protobuf_file),

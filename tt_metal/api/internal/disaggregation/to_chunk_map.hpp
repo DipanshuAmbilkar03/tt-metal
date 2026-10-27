@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,21 +34,29 @@ struct MapGeometry {
 // `topology`, the DRAM bank count + bank order off `spec.arch` (num_dram_banks / optimal_bank_order),
 // `mesh_id` from the call args, and everything else from `policy`.
 //
-// A tensor whose batch axis (axis 0) holds num_slots * num_layers rows folds the layers into it,
-// user-major: row = slot * num_layers + layer (the prefill write layout). Otherwise every layer of the
-// cache resolves to the same rows.
+// A cache holds the model's layers [first_layer, first_layer + num_layers) on one mesh: all of them, or one
+// pipeline stage's. A tensor whose batch axis (axis 0) holds num_slots * num_layers rows folds its layers
+// into it, user-major: row = slot * num_layers + (layer - first_layer) (the prefill write layout).
+// Otherwise every layer of the cache resolves to the same rows.
 struct CacheConfig {
     KvLayoutSpec spec;
     TensorTopology topology;
     GenerationPolicy policy;
     uint64_t base_addr = 0;
     // The table config's name — the key the KV manager pairs a source and a destination config by.
-    // Empty names the config by its decimal index; names must be all empty or all set.
+    // Empty names the config by its decimal index; names must be all empty or all set. Caches sharing a
+    // name are one table config, one per pipeline stage: their layer ranges must not overlap and their
+    // chunks must be the same size.
     std::string name;
-    // The layers this cache publishes, ascending; empty publishes every layer. A layer left out keeps its
-    // addresses (they are arithmetic in the layer) but gets no table rows, for a cache allocated on every
-    // layer that only some layers write.
+    // The layers this cache publishes, ascending, as model layer indices; empty publishes every layer it
+    // holds. A layer left out keeps its addresses (they are arithmetic in the layer) but gets no table
+    // rows, for a cache allocated on every layer that only some layers write.
     std::vector<uint32_t> layers;
+    // The first model layer this cache holds, and how many (0 => through the geometry's last layer).
+    uint32_t first_layer = 0;
+    uint32_t num_layers = 0;
+    // The mesh this cache lives on; nullopt => the mesh to_chunk_map is called with.
+    std::optional<tt::tt_fabric::MeshId> mesh_id;
 };
 
 // The commonized factory. `configs` is a model expressed as an ordered LIST of co-resident caches
@@ -65,7 +74,8 @@ KvChunkAddressTable to_chunk_map(
     const MapGeometry& geometry);
 
 // Everything to_chunk_map reads: a model's caches and the mesh and geometry they are enumerated over. A
-// model exports this so a consumer can derive the same table itself.
+// model exports this so a consumer can derive the same table itself. mesh_id is the mesh of every cache
+// that names none; mesh_shape is every mesh's shape.
 struct CacheLayoutModel {
     std::vector<CacheConfig> caches;
     tt::tt_fabric::MeshId mesh_id{0};
@@ -74,5 +84,12 @@ struct CacheLayoutModel {
 };
 
 KvChunkAddressTable to_chunk_map(const CacheLayoutModel& model);
+
+// The first way `actual` differs from `expected`, or nullopt when they agree: the same configs (name,
+// extents, chunk size, tensor type) and, at every (config, layer, slot, position), the same address, size,
+// device-group members and those members' hosts. Device-group indices are not compared, since builders
+// register groups in different orders.
+std::optional<std::string> first_table_difference(
+    const KvChunkAddressTable& expected, const KvChunkAddressTable& actual);
 
 }  // namespace tt::tt_metal::internal::disaggregation

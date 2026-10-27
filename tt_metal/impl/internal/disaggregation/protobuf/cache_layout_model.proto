@@ -29,8 +29,14 @@ message CacheLayoutConfig {
     CacheTensorTopology topology = 3;
     CacheGenerationPolicy policy = 4;
     uint64 base_addr = 5;
-    // Ascending; empty publishes every layer.
+    // Ascending model layer indices; empty publishes every layer the cache holds.
     repeated uint32 layers = 6;
+    // The model layers [first_layer, first_layer + num_layers) the cache holds; num_layers 0 => through
+    // the last layer. Caches sharing a name (one per pipeline stage) are one table config.
+    uint32 first_layer = 7;
+    uint32 num_layers = 8;
+    // The mesh the cache lives on; absent => the model's mesh_id.
+    optional uint32 mesh_id = 9;
 }
 
 message CacheTensorLayoutSpec {
