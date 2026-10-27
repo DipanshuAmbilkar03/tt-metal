@@ -473,7 +473,11 @@ class ttMLA:
         # routes over all four torus links of every chip, so other fabrics keep the dense gather; False forces the
         # dense gather (a reference for tests).
         if sparse_kv_push is None:
-            sparse_kv_push = self._has_indexer and sparse_kv_push_supported(mesh_device)
+            sparse_kv_push = (
+                self._has_indexer
+                and sparse_kv_push_supported(mesh_device)
+                and os.getenv("TT_SPARSE_KV_PUSH_TMP", "1") != "0"  # TEMP: e2e A/B only, do not commit
+            )
         assert not sparse_kv_push or sparse_kv_push_supported(mesh_device), (
             f"the sparse KV push needs FABRIC_2D_TORUS_XY on a mesh of at least 3x3, got {ttnn.get_fabric_config()} "
             f"on {tuple(mesh_device.shape)}"

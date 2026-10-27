@@ -60,6 +60,10 @@ _SPARSE_MLA_OVERLAP_PROFILE_ALIASES = {"galaxy_rows1": "loudbox_rows1"}
 _SPARSE_MLA_OVERLAP_GATHER_ROWS = 1
 
 
+def sparse_mla_overlap_gather_rows(profile: str) -> int:  # TEMP: main test imports it but main lacks it; do not commit
+    return _SPARSE_MLA_OVERLAP_GATHER_ROWS
+
+
 def get_tt_ccl(mesh_device: ttnn.MeshDevice) -> "TT_CCL":
     """Get or create TT_CCL for mesh_device (cached per device id)."""
     mesh_id = mesh_device.id()
