@@ -20,6 +20,7 @@ Environment overrides:
 - ``WAN_RES_NO_MASK=1``: do not mask the sequence padding out of DBCache's residual diff, to
   measure what the mask costs.
 - ``WAN_RES_SAVE=dir``: save each video's frames as ``<dir>/<W>x<H>_<n>.npy``.
+- ``WAN_RES_VIDEO=dir``: save each video as ``<dir>/<model>_<W>x<H>_<n>.mp4``.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from models.tt_dit.pipelines.events import SectionEnd, SectionStart
 from models.tt_dit.pipelines.wan.dbcache import ExpertCacheRunner
 from models.tt_dit.pipelines.wan.pipeline_wan import WanPipeline, WanPipelineConfig
 from models.tt_dit.pipelines.wan.pipeline_wan_i2v import WanPipelineI2V
+from models.tt_dit.utils.video import export_to_video
 
 from ....utils.test import line_params_req_exact_devices, ring_params_req_exact_devices, skip_if_unsupported_num_links
 from .common import check_first_frame_matches_seed, check_output_sanity
@@ -104,6 +106,7 @@ def test_wan_resolutions(
     num_inference_steps = int(os.environ.get("WAN_RES_STEPS", "40"))
     exact = os.environ.get("WAN_RES_EXACT")
     save_dir = os.environ.get("WAN_RES_SAVE")
+    video_dir = os.environ.get("WAN_RES_VIDEO")
 
     h_factor = tuple(mesh_device.shape)[tp_axis]
     w_factor = tuple(mesh_device.shape)[sp_axis]
@@ -211,6 +214,9 @@ def test_wan_resolutions(
         if save_dir and int(ttnn.distributed_context_get_rank()) == 0:
             Path(save_dir).mkdir(parents=True, exist_ok=True)
             np.save(Path(save_dir) / f"{width}x{height}_{n}.npy", frames)
+        if video_dir and int(ttnn.distributed_context_get_rank()) == 0:
+            Path(video_dir).mkdir(parents=True, exist_ok=True)
+            export_to_video(frames, str(Path(video_dir) / f"{model}_{width}x{height}_{n}.mp4"), fps=16)
 
     logger.info("\n".join(report))
     pipeline.release_traces()
