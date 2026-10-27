@@ -36,9 +36,14 @@ Once per set of indices (the first shared layer after a full layer, or the full 
 **Overlap with attention.** A layer whose successor reuses its indices runs `sparse_sdpa` with the successor's
 prefix push fused in (`SparseSDPAPushFusedFactory`): attention on the overlap profile's top-k grid, the push senders
 and muxes on its gather grid, in one program. The prefix part holds rows written by earlier chunks; the successor
-then pushes the remainder (`part=2`, its own chunk's rows) before its attention. Compact buffers alternate by
-layer parity, so layer L reads its buffer while L+1's fills. Without an overlap profile, a shared layer pushes all
-its rows itself (`part=0`).
+then pushes the remainder (`part=2`, its own chunk's rows) before its attention. Without an overlap profile, a
+shared layer pushes all its rows itself (`part=0`).
+
+**Buffers.** A chip's distinct rows are at most its query rows x top-k, so the push buffer is sized from the chunk at
+init (`SparseKvPushPlanner.buffer_rows`; 222 MiB at a 1M cache instead of 703 MiB), not from the cache. Layer L reads
+one buffer while L+1's fills: counting from the last full layer, even layers use the dense gather buffer (idle
+outside full layers) and odd layers the push buffer. When the push buffer does not fit in the dense one (small
+caches), two push buffers alternate instead.
 
 ## Trace safety
 

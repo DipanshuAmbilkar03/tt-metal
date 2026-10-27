@@ -150,13 +150,13 @@ void SparseKvPushDeviceOperation::validate_on_program_cache_miss(
         output_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
             output_tensor.memory_config().buffer_type() == BufferType::DRAM,
         "sparse_kv_push requires an interleaved DRAM output");
-    // The compact buffer pads each owner's stream to whole bank-lane units, so it may be taller than the gathered slot.
+    // No row-count floor: slots stop at the requester's distinct rows plus per-owner padding, which the caller sizes
+    // for (SparseKvPushPlanner.buffer_rows), so the buffer may be far shorter than the gathered slot.
     TT_FATAL(
         output_shape.rank() == 4 && output_shape[0] == 1 && output_shape[1] == input_shape[1] &&
-            output_shape[3] == input_shape[3] && output_shape[kRowDim] >= input_shape[kRowDim] * num_devices,
-        "sparse_kv_push output must be [1, {}, >= {}, {}], got {}",
+            output_shape[3] == input_shape[3],
+        "sparse_kv_push output must be [1, {}, rows, {}], got {}",
         input_shape[1],
-        input_shape[kRowDim] * num_devices,
         input_shape[3],
         output_shape);
 }

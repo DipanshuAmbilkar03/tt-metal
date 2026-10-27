@@ -212,7 +212,8 @@ def test_sparse_kv_push_real_topk_matches_gather(mesh_device, layer):
     stripe_chunk = s_local = chunk_global // n_dev
     cache_tokens = _TRACE_1M_START + chunk_global
     pages_per_packet = max(1, ttnn.get_tt_fabric_max_payload_size_bytes() // 704)
-    buffer_rows = cache_tokens + n_dev * pages_per_packet * _DRAM_BANKS
+    # Capped at the chip's query rows x top-k, as the model sizes it, not at the cache.
+    buffer_rows = min(cache_tokens, s_local * TOPK) + n_dev * pages_per_packet * _DRAM_BANKS
 
     common = dict(layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     shard_seq = ttnn.ShardTensorToMesh(mesh_device, dim=2)

@@ -70,7 +70,7 @@ class SparseKvPushPlanner:
         self.prefetched = {}
 
     def push_buffer(self, parity, rows, like):
-        """Compact buffer for layers of this parity; the previous layer's buffer stays readable while it fills."""
+        """Compact buffer `parity` (0 or 1); the previous layer's buffer stays readable while this one fills."""
         key = (parity, rows, like.shape[-1], like.dtype)
         if key not in self._buffers:
             self._buffers[key] = _replicated(
@@ -89,10 +89,13 @@ class SparseKvPushPlanner:
         self._last = None
         self.prefetched.clear()
 
-    def buffer_rows(self, rows: int, page_bytes: int) -> int:
-        """Compact buffer rows for up to `rows` distinct rows: each owner's run pads to whole bank-lane units."""
+    def buffer_rows(self, distinct_rows: int, max_rows: int, stripe_chunk: int, page_bytes: int) -> int:
+        """Compact buffer rows for up to `distinct_rows` needed rows (a chip's query rows x top-k bounds them). Each
+        owner's run pads to whole bank-lane units, and no owner holds more than its share of the cache's blocks."""
+        n = self.mesh_device.get_num_devices()
         unit = self._pages_per_packet(page_bytes) * self.banks
-        return rows + self.mesh_device.get_num_devices() * unit
+        owner_rows = -(-(-(-max_rows // stripe_chunk)) // n) * stripe_chunk
+        return min(min(distinct_rows, max_rows) + n * unit, n * -(-owner_rows // unit) * unit)
 
     @staticmethod
     def _pages_per_packet(page_bytes: int) -> int:

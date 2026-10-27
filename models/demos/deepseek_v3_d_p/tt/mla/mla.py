@@ -645,6 +645,23 @@ class ttMLA:
                 dtype=self.sparse_kv_cache_format.storage_dtype,
                 layout=self.sparse_kv_cache_format.storage_layout,
             )
+        # Push buffer, sized at init from the chunk: a chip's distinct rows are at most its query rows x top-k. When
+        # that fits in the dense gather buffer, shared layers alternate between it (idle outside full layers) and one
+        # push buffer; otherwise between two push buffers.
+        self._sparse_push_rows = None
+        self._sparse_push_reuses_dense = False
+        if self._sparse_kv_push and self._sparse_kv_gather_buffer is not None:
+            dense = self._sparse_kv_gather_buffer
+            _, _, query_rows, topk = self.indexer_indices_shape()
+            planner = self.tt_ccl.get_sparse_kv_push(self.ccl_num_links)[0]
+            self._sparse_push_rows = planner.buffer_rows(
+                query_rows * topk,
+                dense.shape[2],
+                self.active_seq_len_local // self.tp_factor,
+                self._sparse_push_page_bytes(dense),
+            )
+            self._sparse_push_reuses_dense = self._sparse_push_rows <= dense.shape[2]
+            planner.push_buffer(0, self._sparse_push_rows, dense)
         # GLM-5.3 indexer reuse: a "shared" layer is sparse but owns no indexer weights — it reuses the
         # most recent "full" layer's top-k indices, injected at forward, and binds a weight-less
         # ReuseIndexer (never computes). Absent indexer_types (v3.1 / v3.2) every layer is
@@ -2036,14 +2053,25 @@ class ttMLA:
             return {prefix + name: value for name, value in zip(names, values)}
         return {f"{prefix}batch_index": cache_batch_idx}
 
+    @staticmethod
+    def _sparse_push_page_bytes(tensor):
+        row_bytes = tensor.shape[-1] * (1 if tensor.dtype == ttnn.fp8_e4m3 else 2)
+        return -(-row_bytes // 64) * 64
+
     def _sparse_push_buffer(self, planner, kvpe_cache, layer_idx):
-        """The compact buffer of `layer_idx`'s parity and its DRAM-aligned row page size."""
-        storage = kvpe_cache.storage
-        row_bytes = storage.shape[-1] * (1 if storage.dtype == ttnn.fp8_e4m3 else 2)
-        page_bytes = -(-row_bytes // 64) * 64
+        """The compact buffer `layer_idx` reads and its DRAM-aligned row page size."""
         dense = self._sparse_kv_gather_buffer
-        buffer = planner.push_buffer(layer_idx % 2, planner.buffer_rows(dense.shape[2], page_bytes), dense)
-        return buffer, page_bytes
+        page_bytes = self._sparse_push_page_bytes(kvpe_cache.storage)
+        if not self._sparse_push_reuses_dense:
+            return planner.push_buffer(layer_idx % 2, self._sparse_push_rows, dense), page_bytes
+        # Parity counts from the last full layer (global indexer_types, so pipeline stages agree): the full layer reads
+        # the dense buffer while prefetching into the push buffer, then shared layers alternate.
+        full = layer_idx
+        while full > 0 and indexer_layer_is_reused(self.config, full):
+            full -= 1
+        if (layer_idx - full) % 2 == 0:
+            return dense, page_bytes
+        return planner.push_buffer(0, self._sparse_push_rows, dense), page_bytes
 
     def _sparse_push_plan(self, indices, kvpe_cache, seq_len_local, kv_actual_isl, layer_idx, metadata=None):
         """The (cached) push plan for `indices` and the compact buffer of `layer_idx`'s parity."""
