@@ -126,7 +126,8 @@ void FabricBuilderContext::compute_max_channel_counts() {
 
     // A Z-facing intermesh boundary introduces the boundary family (5 VC0 / 4 VC1) and mesh routers
     // on the same chips (4 VC0 / 4 VC1 when non-express); enumerate both. VC1 is required because
-    // the boundary shape is defined by its from-boundary VC1 fanout.
+    // the boundary shape is defined by its from-boundary VC1 fanout, unless intermesh_on_vc0 puts
+    // that fanout on VC0 (then there is no VC1, and the N and S mesh routers get one more VC0 slot).
     const bool has_intermesh_z_boundary =
         (intermesh_vc_config_.requires_vc1 || intermesh_vc_config_.intermesh_on_vc0) &&
         fabric_has_intermesh_z_edge(control_plane.get_mesh_graph());
@@ -387,6 +388,7 @@ IntermeshVCConfig FabricBuilderContext::compute_intermesh_vc_config() const {
 
             // Opt-in: inter-mesh traffic on VC0 and no VC1, so no intra-mesh router polls VC1 channels on every
             // pass. The caller vouches that its inter-mesh traffic cannot form a buffer cycle across meshes.
+            // The D2D stream service reads the same variable and turns on its relay (D2DStreamConfig::relay).
             const char* on_vc0 = std::getenv("TT_METAL_FABRIC_INTERMESH_VC0");
             if (on_vc0 != nullptr && std::string_view(on_vc0) == "1" && !needs_mesh_pass_through) {
                 config = IntermeshVCConfig::disabled();

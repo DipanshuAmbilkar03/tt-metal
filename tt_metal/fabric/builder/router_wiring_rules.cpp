@@ -150,6 +150,8 @@ bool wires_into(
 
     // A boundary producer's VC1 receiver fans out to non-self VC1 senders; its VC0 receiver crosses
     // over to downstream VC1 and feeds nothing on VC0. This is the only VC-sensitive producer role.
+    // With intermesh_on_vc0 there is no VC1: turn_set_for_router and router_vc_shape wire the boundary
+    // to the N and S routers on VC0 themselves, without this relation.
     if (producer_role == TurnRole::BOUNDARY) {
         return vc == 1;
     }
@@ -249,11 +251,11 @@ RouterVcShape router_vc_shape(
     // configuration error, not a silently five-wide router.
     TT_FATAL(
         !z_boundary_router || is_2D_topology(topology), "A Z-facing intermesh boundary router requires a 2D topology");
-    // And it cannot exist without VC1: its whole shape is the from-boundary VC1 fanout.
+    // And it needs VC1 for its from-boundary fanout, unless intermesh_on_vc0 puts that fanout on VC0.
     const bool intermesh_on_vc0 = vc_config && vc_config->intermesh_on_vc0;
     TT_FATAL(
         !z_boundary_router || requires_vc1 || intermesh_on_vc0,
-        "A Z-facing intermesh boundary router cannot be constructed without VC1");
+        "A Z-facing intermesh boundary router needs VC1, or inter-mesh traffic on VC0");
 
     RouterVcShape shape{};
 
@@ -352,12 +354,12 @@ RouterTurnSet turn_set_for_router(
     // configuration error, not a silently five-wide router.
     TT_FATAL(
         !z_boundary_router || is_2D_topology(topology), "A Z-facing intermesh boundary router requires a 2D topology");
-    // And it cannot exist without VC1: its whole shape is the from-boundary VC1 fanout.
+    // And it needs VC1 for its from-boundary fanout, unless intermesh_on_vc0 puts that fanout on VC0.
     const bool intermesh_on_vc0 = vc_config && vc_config->intermesh_on_vc0;
     TT_FATAL(
         !z_boundary_router || enable_vc1 || intermesh_on_vc0,
-        "A Z-facing intermesh boundary router cannot be constructed without VC1: its entire "
-        "shape is the from-boundary VC1 fanout");
+        "A Z-facing intermesh boundary router needs VC1, or inter-mesh traffic on VC0: its entire "
+        "shape is the from-boundary fanout");
 
     // One emission rule for every ordinary target: VC0 always, VC1 when the VC exists.
     const auto emit_on_enabled_vcs = [&turn_set, enable_vc1](RoutingDirection dir) {
@@ -372,6 +374,8 @@ RouterTurnSet turn_set_for_router(
     // arm here -- traffic arriving on its VC0 receiver crosses over onto these same VC1
     // downstream senders instead. Nothing in the turn matrix applies to it, which is why the
     // set is the full set: not a special case, a consequence.
+    // With intermesh_on_vc0 there is no VC1, so the template is on VC0 and holds only N and S:
+    // a landed packet's destination is in the landing chip's column, so it never turns E or W.
     if (z_boundary_router) {
         for (const auto dir : k_cardinal_directions) {
             if (intermesh_on_vc0) {
