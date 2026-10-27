@@ -54,27 +54,14 @@ inline void calculate_moe_silu_fast() {
 
 // silu(gate) * up with both operands already in DEST: the plain-SiLU twin of situ_glu / swiglu_oai,
 // so the fused fold_binary_act_blocked path serves SiLU too and the bf16 slice CBs drop out.
-//
-// With a bf16 DEST the product keeps the precision of a LoFi FPU multiply: silu rounded to bf16 and
-// cut to 4 mantissa bits (srcA), up cut to 6 (srcB). The op's bf16-DEST matmuls read ~4.6% high, and
-// that truncation (~-2.2%) offsets part of it; an exact product leaves the whole bias in every layer
-// and measurably lowers end-to-end KV PCC. An fp32 DEST has no such bias, so its product stays exact.
 template <bool is_fp32_dest_acc_en, int ITERATIONS>
 inline void calculate_moe_silu_glu(const uint gate_tile_idx, const uint up_tile_idx, const uint out_tile_idx) {
     constexpr uint dst_tile_size = 32;  // 32 rows per tile in SFPU addressing
-    [[maybe_unused]] const sfpi::vUInt lofi_srca_mask = 0xFFF80000u;  // sign, exponent, 4 mantissa bits
-    [[maybe_unused]] const sfpi::vUInt lofi_srcb_mask = 0xFFFE0000u;  // sign, exponent, 6 mantissa bits
 #pragma GCC unroll 4
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat gate = sfpi::dst_reg[gate_tile_idx * dst_tile_size];
         sfpi::vFloat up = sfpi::dst_reg[up_tile_idx * dst_tile_size];
-        sfpi::vFloat act = moe_silu_fast_value<is_fp32_dest_acc_en>(gate);
-        if constexpr (!is_fp32_dest_acc_en) {
-            act = sfpi::convert<sfpi::vFloat16b>(act, sfpi::RoundMode::Nearest);
-            act = sfpi::as<sfpi::vFloat>(sfpi::as<sfpi::vUInt>(act) & lofi_srca_mask);
-            up = sfpi::as<sfpi::vFloat>(sfpi::as<sfpi::vUInt>(up) & lofi_srcb_mask);
-        }
-        sfpi::vFloat result = act * up;
+        sfpi::vFloat result = moe_silu_fast_value<is_fp32_dest_acc_en>(gate) * up;
         if constexpr (!is_fp32_dest_acc_en) {
             result = sfpi::convert<sfpi::vFloat16b>(result, sfpi::RoundMode::Nearest);
         }
