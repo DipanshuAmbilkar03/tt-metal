@@ -71,7 +71,7 @@ struct SDPAForwardCbTiles {
     uint32_t stat;    // each of max prev/cur, exp max diff, sum prev/cur
     uint32_t mm_out;  // each of prev/cur
     uint32_t output;
-    uint32_t partial;  // each of partial in / partial out (split units)
+    uint32_t partial;  // each of partial in / partial out (split units): four rows, two per NoC batch
     uint32_t alpha;    // the partial's rescale factor (split units)
 };
 
