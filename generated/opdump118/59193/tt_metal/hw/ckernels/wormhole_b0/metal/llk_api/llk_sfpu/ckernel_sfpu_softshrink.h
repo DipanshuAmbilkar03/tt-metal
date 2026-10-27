@@ -1,0 +1,37 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <cstdint>
+#include "cmath_common.h"
+#include "sfpi.h"
+#include "sfpu/ckernel_sfpu_converter.h"
+
+namespace ckernel::sfpu {
+
+inline void softshrink_init() { math::reset_counters(p_setrwc::SET_ABD_F); }
+
+// The param0 the generated softshrink kernel is fitted for, as FP32 bits; any other param0 runs the stock kernel.
+inline constexpr std::uint32_t softshrink_bf16_param0_bits = 0x3f000000u;
+// Whether BF16 DEST runs the generated softshrink kernel as one call over the whole tile.
+inline constexpr bool softshrink_bf16_whole_tile = false;
+// The stock softshrink kernel needs no BF16 setup.
+template <bool bf16_kernel>
+inline void softshrink_bf16_tile_init() {}
+
+template <bool APPROXIMATION_MODE, int ITERATIONS, bool is_fp32_dest_acc_en = true>
+inline void calculate_softshrink(std::uint32_t param0) {
+    // Softshrink(x) = x - λ if x > λ, x + λ if x < -λ, else 0
+    // Algebraically identical to x - clamp(x, -λ, λ)
+    sfpi::vFloat lambda = Converter::as_float(param0);
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vFloat v = sfpi::dst_reg[0];
+        sfpi::dst_reg[0] = v - sfpi::clamp(v, -lambda, lambda);
+        sfpi::dst_reg++;
+    }
+}
+
+}  // namespace ckernel::sfpu
