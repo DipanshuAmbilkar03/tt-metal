@@ -21,6 +21,11 @@ import torch
 import ttnn
 from tests.ttnn.utils_for_testing import assert_allclose, assert_equal
 
+# Every test in this module takes the function-scoped `device` fixture without
+# parametrizing device_params, so the device is opened once per module rather than
+# once per test.
+pytestmark = pytest.mark.use_module_device
+
 _WH_BH_ONLY = pytest.mark.skipif(
     ttnn.get_arch_name() not in ("wormhole_b0", "blackhole"),
     reason="WH/BH-only descriptor-kernel coverage; Quasar uses the separate DFB implementation",
