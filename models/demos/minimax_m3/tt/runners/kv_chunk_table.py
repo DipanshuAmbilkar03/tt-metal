@@ -29,6 +29,10 @@ receives every stripe on all its columns).
 The per-chip DRAM addressing (32-token blocks round-robin across the DRAM banks, block-cyclic positions,
 user-major ``slot*num_layers+layer`` fold) matches DeepSeek's ``create_kv_chunk_address_table_block_cyclic``, just
 repeated per config with each tensor's own ``buffer_address()`` / ``chunk_size_bytes`` and column set.
+
+On one mesh with index_k TP-replicated, the table is derived from the caches' declared layout instead
+(``cache_layout.py``), and that ``CacheLayoutModel`` is written next to the table for a consumer that derives
+the table itself. The pipeline-parallel merge and a TP-deduped index_k keep the walk below.
 """
 
 import socket
@@ -37,6 +41,7 @@ from loguru import logger
 
 import ttnn
 from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
+from models.demos.minimax_m3.tt.runners.cache_layout import LAYOUT_MODEL_SUFFIX, m3_cache_layout_model
 
 # bf8_b / bf16 TILE byte sizes (32x32 tile). bf8_b = 1024 mantissa + 64 exponent bytes; bf16 = 2048.
 _TILE_BYTES = {ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}
@@ -68,6 +73,46 @@ def _make_config(*, num_layers, max_seq_len, num_users, chunk_size_bytes):
     cfg.chunk_n_tokens = NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
     cfg.chunk_size_bytes = chunk_size_bytes
     return cfg
+
+
+def _single_mesh_fabric_node_ids(mesh_device, sp, cols):
+    """This mesh's fabric node ids by (SP row, TP column), if they number its chips row-major as
+    ``to_chunk_map`` does; else None."""
+    fnids = [[mesh_device.get_fabric_node_id(ttnn.MeshCoordinate(r, c)) for c in range(cols)] for r in range(sp)]
+    mesh_id = fnids[0][0].mesh_id
+    row_major = all(
+        int(fnids[r][c].mesh_id) == int(mesh_id) and int(fnids[r][c].chip_id) == r * cols + c
+        for r in range(sp)
+        for c in range(cols)
+    )
+    return fnids if row_major else None
+
+
+def _export_from_layout_model(*, mesh_device, kv_cache, fnids, sp, cols, path, **model_args):
+    """Derive the table from the caches' CacheLayoutModel, write the model to ``path +
+    LAYOUT_MODEL_SUFFIX`` and the table to ``path``."""
+    model = m3_cache_layout_model(
+        kv_cache=kv_cache,
+        base_addrs=tuple(int(t.buffer_address()) for t in (kv_cache.k, kv_cache.v, kv_cache.index_k)),
+        mesh_id=fnids[0][0].mesh_id,
+        mesh_shape=(sp, cols),
+        arch=mesh_device.arch(),
+        **model_args,
+    )
+    table = ttnn.experimental.disaggregation.to_chunk_map(model)
+    host_name = socket.gethostname()
+    for row in fnids:
+        for fid in row:
+            table.set_fabric_node_host(fid, host_name=host_name)
+    model_path = path + LAYOUT_MODEL_SUFFIX
+    ttnn.experimental.disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
+    ttnn.experimental.disaggregation.export_to_protobuf_file(table, path)
+    logger.info(
+        f"[migration] M3 KV chunk address table derived from its cache layout model ({model_path}) and "
+        f"serialized to {path} (configs={len(model.caches)}, layers={model.geometry.num_layers}, "
+        f"entries={table.total_entries()}, index_k=TP-replicated ({cols}-chip groups))"
+    )
+    return path
 
 
 def build_and_serialize_kv_chunk_table(
@@ -154,6 +199,29 @@ def build_and_serialize_kv_chunk_table(
         assert tokens_per_chunk_local % (cols * NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK) == 0, (
             f"TP-deduped index_k needs chunk_local {tokens_per_chunk_local} split into {cols} stripes of whole "
             f"{NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK}-token chunks"
+        )
+
+    if stage_layouts is None and sp_axis == 0 and not index_k_tp_sharded:
+        fnids = _single_mesh_fabric_node_ids(mesh_device, sp, cols)
+        if fnids is not None:
+            return _export_from_layout_model(
+                mesh_device=mesh_device,
+                kv_cache=kv_cache,
+                fnids=fnids,
+                sp=sp,
+                cols=cols,
+                path=path,
+                num_users=num_users,
+                num_layers=num_layers,
+                seq_len=seq_len,
+                chunk_size=chunk_size,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                index_k_layers=index_k_layers,
+            )
+        logger.warning(
+            "[migration] this mesh's fabric chip ids are not row-major, so the M3 KV chunk table is walked "
+            "instead of derived from its cache layout model"
         )
 
     if stage_layouts is None:
