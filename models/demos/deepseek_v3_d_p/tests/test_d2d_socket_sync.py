@@ -270,6 +270,7 @@ def test_d2d_socket_sync_shared_links(mesh_device, relay):
 # (first sender row, first receiver row, rows per side). Every column sends straight down,
 # so all flows of a column use the same Y links. 3->4 and 0->7 have one flow per link (1 and
 # 7 hops); 2-3->4-5 and 0-3->4-7 put 2 and 4 flows on the link between rows 3 and 4.
+# 0->7 runs direct only: rows 0 and 7 share no link, so relay mode cannot plan a cable.
 @pytest.mark.parametrize(
     "rows",
     [(0, 4, 4), (3, 4, 1), (0, 7, 1), (2, 4, 2)],
@@ -300,6 +301,9 @@ def test_d2d_socket_sync_shared_links_timing(mesh_device, relay, rows):
     if not is_blackhole():
         pytest.skip("D2DStreamService needs Blackhole (or UBB Galaxy) service cores")
     send_row0, recv_row0, n_rows = rows
+    if relay and recv_row0 != send_row0 + n_rows:
+        # Relay mode needs a direct link between the two submeshes; the 8x4 mesh has no wrap-around.
+        pytest.skip("relay mode needs the two submeshes to be adjacent")
     cols = mesh_device.shape[1]
     sender_mesh = mesh_device.create_submesh(ttnn.MeshShape(n_rows, cols), offset=ttnn.MeshCoordinate(send_row0, 0))
     receiver_mesh = mesh_device.create_submesh(ttnn.MeshShape(n_rows, cols), offset=ttnn.MeshCoordinate(recv_row0, 0))
