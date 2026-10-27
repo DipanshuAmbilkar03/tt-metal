@@ -71,8 +71,17 @@ DATASETS = {
         # same-build 256K runs differ by up to about 0.006 top-1, 0.03 ΔNLL and 0.02 KL; the limits leave room for it.
         likelihood_limits={0: (0.87, 0.36, 0.18), 8192: (0.86, 0.39, 0.24), 65536: (0.87, 0.39, 0.19)},
     ),
-    # InfiniteBench Code.Run id=391. Report-only until its limits are measured.
-    "code_run": Dataset(trace_dir=GPU_TRACES / "hf-gemma4-31b-coding-example-transformed"),
+    # InfiniteBench Code.Run id=391, 111161 tokens.
+    "code_run": Dataset(
+        trace_dir=GPU_TRACES / "hf-gemma4-31b-coding-example-transformed",
+        min_per_head_pcc=0.89,
+        min_overall_pcc=0.97,
+        max_overall_rrmse=0.235,
+        # Measured at full length with chunk 8192: two builds on two hosts gave identical results, 0.9003 worst-head
+        # and 0.9759 overall PCC, 0.2200 RRMSE, and 0.965 / 0.972 / 0.977 top-1, -0.023 / -0.003 / -0.002 ΔNLL and
+        # 0.019 / 0.007 / 0.008 KL. The limits leave room for kernel and compiler numerics changes.
+        likelihood_limits={0: (0.94, 0.03, 0.05), 8192: (0.95, 0.04, 0.04), 65536: (0.95, 0.04, 0.04)},
+    ),
 }
 
 
