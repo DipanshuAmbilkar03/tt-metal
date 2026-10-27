@@ -479,7 +479,8 @@ RelayPlan make_relay_plan(
     const auto& local_nodes = is_sender ? sender_nodes : receiver_nodes;
     const auto& peer_nodes = is_sender ? receiver_nodes : sender_nodes;
 
-    // 1. Every (exit, entry) coord pair joined by a direct link, seen from this side's chips.
+    // 1. Find every direct link between the two meshes, as (exit coord, entry coord) pairs seen from this side's
+    //    chips. Two links between the same two chips give one pair: one cable, whose links become its lanes.
     std::set<std::pair<distributed::MeshCoordinate, distributed::MeshCoordinate>> candidates;
     for (const auto& c : coords) {
         const auto node = local_nodes.at(c);
@@ -501,8 +502,9 @@ RelayPlan make_relay_plan(
         }
     }
 
-    // 2. Keep at most one cable per chip. A coord may not be the exit of one cable and the
-    //    entry of another: its data would have to use both.
+    // 2. Choose the cables: at most one cable per chip, so a chip linked to two chips of the other mesh keeps
+    //    only the first. A coord may not be the exit of one cable and the entry of another: its data would
+    //    have to use both.
     RelayPlan plan;
     std::set<distributed::MeshCoordinate> exits;
     std::set<distributed::MeshCoordinate> entries;
@@ -518,12 +520,14 @@ RelayPlan make_relay_plan(
     }
     TT_FATAL(!plan.cables.empty(), "D2DStreamService relay: no direct link between the sender and receiver meshes");
 
-    // 3. Assign coords. A cable chip takes its own coord. Every other coord goes to the cable
-    //    with the fewest hops (exit side + entry side), at most ceil(coords / cables) each.
+    // 3. Give every coord to a cable and a slot on it. Slot k is DRAM staging tensor k on the cable's exit and
+    //    entry chips: the exit chip collects that coord's data there before the cable, and the entry chip
+    //    receives it there before forwarding it to the coord. A cable chip's own coord skips the staging.
     const uint32_t num_cables = static_cast<uint32_t>(plan.cables.size());
     const uint32_t cap = std::max<uint32_t>(2, (coords.size() + num_cables - 1) / num_cables);
     std::vector<uint32_t> load(num_cables, 0);
     std::map<distributed::MeshCoordinate, uint32_t> cable_of;
+    // 3a. A cable chip's own coord goes to its cable: its data is already at the cable on that side.
     for (uint32_t p = 0; p < num_cables; ++p) {
         for (const auto& c : {plan.cables[p].exit_coord, plan.cables[p].entry_coord}) {
             if (cable_of.emplace(c, p).second) {
@@ -531,6 +535,8 @@ RelayPlan make_relay_plan(
             }
         }
     }
+    // 3b. Every other coord goes to the cable with the fewest hops (exit side + entry side), at most
+    //     cap coords per cable (ceil(coords / cables), at least 2); on a tie, the cable with fewer coords.
     for (const auto& c : coords) {
         if (cable_of.contains(c)) {
             continue;
@@ -552,10 +558,12 @@ RelayPlan make_relay_plan(
         cable_of.emplace(c, best);
         load[best] += 1;
     }
+    // 3c. Number each cable's slots in sorted coord order, so both sides number them the same way.
     for (const auto& [c, p] : cable_of) {  // std::map order = sorted coords
         plan.slot_of[c] = {p, static_cast<uint32_t>(plan.cables[p].slots.size())};
         plan.cables[p].slots.push_back(c);
     }
+    // 3d. Check the slot count per cable, size the staging tensors (max_slots) and log each cable.
     for (const auto& cable : plan.cables) {
         TT_FATAL(
             cable.slots.size() <= 32, "D2DStreamService relay: {} coords on one cable (max 32)", cable.slots.size());
