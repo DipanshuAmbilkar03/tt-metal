@@ -22,6 +22,7 @@ bank order: 32-token blocks round-robin over the banks, and SP row r owning ``[n
 """
 
 import ttnn
+from models.demos.common.prefill.runners.cache_layout import CacheLayoutNotDerivable, row_major_mesh_id
 from models.demos.minimax_m3.tt.attention.kv_cache import (
     BH_NUM_DRAM_BANKS,
     NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK,
@@ -30,14 +31,8 @@ from models.demos.minimax_m3.tt.attention.kv_cache import (
 
 disaggregation = ttnn.experimental.disaggregation
 
-# The model is written next to the table it derives: ``<table path><LAYOUT_MODEL_SUFFIX>``.
-LAYOUT_MODEL_SUFFIX = ".cache_layout.pb"
 # The cache's ND-shard grid is the BH_NUM_DRAM_BANKS Blackhole DRAM banks.
 CACHE_ARCH = ttnn.device.Arch.BLACKHOLE
-
-
-class CacheLayoutNotDerivable(Exception):
-    """The caches' layout is one the CacheLayoutModel cannot yet declare."""
 
 
 def _spec(dtype, *, num_users, stage_layers, seq_len, head_dim):
@@ -57,19 +52,6 @@ def _replicated_topology(sp, cols):
     shape = ttnn.MeshShape(sp, cols)
     coords = [ttnn.MeshCoordinate(row, col) for row in range(sp) for col in range(cols)]
     return ttnn.TensorTopology(shape, [ttnn.PlacementShard(2), ttnn.PlacementReplicate()], coords)
-
-
-def _stage_mesh_id(stage, sp, cols):
-    """The stage's mesh, whose chips its fabric node ids must number row-major as to_chunk_map does."""
-    fnids = stage["fnids"]
-    mesh_id = int(fnids[0][0].mesh_id)
-    for r in range(sp):
-        for c in range(cols):
-            if (int(fnids[r][c].mesh_id), int(fnids[r][c].chip_id)) != (mesh_id, r * cols + c):
-                raise CacheLayoutNotDerivable(
-                    f"stage at layer {stage['first_layer']} numbers its chips other than row-major over its mesh"
-                )
-    return ttnn.MeshId(mesh_id)
 
 
 def m3_cache_layout_model(
@@ -131,7 +113,7 @@ def m3_cache_layout_model(
                     layers=index_k_published if is_index_k else [],
                     first_layer=stage["first_layer"],
                     num_layers=stage["count"],
-                    mesh_id=_stage_mesh_id(stage, sp, cols),
+                    mesh_id=row_major_mesh_id(stage["fnids"], sp, cols, f"stage at layer {stage['first_layer']}"),
                 )
             )
     num_layers = sum(stage["count"] for stage in stage_layouts[0])

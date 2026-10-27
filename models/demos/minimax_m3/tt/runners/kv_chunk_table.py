@@ -36,20 +36,14 @@ table is published and the derived one is checked against it; the model is writt
 (``<path>.cache_layout.pb``), for a consumer that derives the table itself, only when the two agree.
 """
 
-import os
 import socket
 
 from loguru import logger
 
 import ttnn
+from models.demos.common.prefill.runners.cache_layout import publish_kv_chunk_table
 from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
-from models.demos.minimax_m3.tt.runners.cache_layout import (
-    LAYOUT_MODEL_SUFFIX,
-    CacheLayoutNotDerivable,
-    m3_cache_layout_model,
-)
-
-disaggregation = ttnn.experimental.disaggregation
+from models.demos.minimax_m3.tt.runners.cache_layout import m3_cache_layout_model
 
 # Set to 1 to publish the table derived from the caches' CacheLayoutModel without walking the classic one.
 LAYOUT_MODEL_ENV = "M3_KV_TABLE_FROM_LAYOUT_MODEL"
@@ -90,35 +84,6 @@ def _host_name(stage):
     """The gathered layout carries a per-host crc32 tag (allgather_int can't move strings); the single-rank
     synthesized stage carries the real local hostname instead."""
     return stage.get("host_name") or f"host-{stage['host_tag']:08x}"
-
-
-def _derived_table(model, stage_layouts):
-    """The table to_chunk_map derives from ``model``, with every stage's chips on its host."""
-    table = disaggregation.to_chunk_map(model)
-    for layout in stage_layouts:
-        for stage in layout:
-            for row in stage["fnids"]:
-                for fid in row:
-                    table.set_fabric_node_host(fid, host_name=_host_name(stage))
-    return table
-
-
-def _check_layout_model(walked, model, not_derivable, stage_layouts, path):
-    """Checks the table derived from the caches' layout model against the walked one, and writes the model
-    next to the table only when they agree."""
-    if model is None:
-        logger.info(f"[migration] M3 cache layout model not derived ({not_derivable}); the walked table stands alone")
-        return
-    difference = disaggregation.first_table_difference(walked, _derived_table(model, stage_layouts))
-    if difference is not None:
-        logger.error(
-            f"[migration] the KV chunk table derived from the M3 cache layout model differs from the walked "
-            f"table at {difference}; publishing the walked table without the model"
-        )
-        return
-    model_path = path + LAYOUT_MODEL_SUFFIX
-    disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
-    logger.info(f"[migration] the M3 cache layout model derives the walked KV chunk table; wrote it to {model_path}")
 
 
 def build_and_serialize_kv_chunk_table(
@@ -248,9 +213,81 @@ def build_and_serialize_kv_chunk_table(
                 f"space, so kv_migration_stages must report the same range for all three."
             )
 
-    model, not_derivable = None, None
-    try:
-        model = m3_cache_layout_model(
+    def walk():
+        table = ttnn.experimental.disaggregation.KvChunkAddressTable(
+            {
+                config_name(i, len(specs)): _make_config(
+                    num_layers=total_layers,
+                    max_seq_len=seq_len,
+                    num_users=num_users,
+                    chunk_size_bytes=_chunk_size_bytes(dtype, head_dim),
+                )
+                for i, (_, _, _, dtype) in enumerate(specs)
+            }
+        )
+
+        hosts_set = set()
+
+        for config_id, (label, tensor_idx, row_groups, dtype) in enumerate(specs):
+            chunk_bytes = _chunk_size_bytes(dtype, head_dim)
+            # Each group of a row owns an equal stripe of the row's per-chunk slab (the whole slab when the
+            # row has a single group).
+            tokens_per_group = tokens_per_chunk_local // len(row_groups)
+            for stage in stage_layouts[tensor_idx]:
+                base_addr = stage["base_addr"]
+                num_banks = stage["num_banks"]
+                host_name = _host_name(stage)
+                first = stage["first_layer"]
+                filter_layers = label == "index_k" and index_k_layers is not None
+                for global_row in range(sp):
+                    for stripe, group_cols in enumerate(row_groups):
+                        fabric_node_ids = [stage["fnids"][global_row][c] for c in group_cols]
+                        group_idx = table.add_device_group(fabric_node_ids)
+                        for fid in fabric_node_ids:
+                            key = (int(fid.mesh_id), int(fid.chip_id))
+                            if key not in hosts_set:
+                                table.set_fabric_node_host(fid, host_name=host_name)
+                                hosts_set.add(key)
+
+                        # Replay the ND-shard ROUND_ROBIN_1D walk: 32-token blocks round-robin across the DRAM
+                        # banks (per chip / per tensor), advancing the per-bank offset after each full bank
+                        # sweep. The base address is identical on every chip (the tensor is allocated
+                        # identically everywhere), and each group's chips hold the same rows, so one walk per
+                        # group covers them. Each stage restarts the walk from ITS base address and writes at
+                        # the GLOBAL layer index; the slot fold on device is per-stage (slot * stage_count +
+                        # local_layer), which this slot -> local-layer order replays.
+                        curr_bank_id = 0
+                        curr_bank_offset = 0
+                        for slot in range(num_users):
+                            for local_layer in range(stage["count"]):
+                                global_layer = first + local_layer
+                                # A layer without index_k gets no rows, but still walks its region so later
+                                # layers keep their real addresses.
+                                publish = not filter_layers or global_layer in index_k_layers
+                                for seq_chunk in range(num_chunks_per_seq_len):
+                                    chunk_token_start = (
+                                        seq_chunk * chunk_size
+                                        + global_row * tokens_per_chunk_local
+                                        + stripe * tokens_per_group
+                                    )
+                                    chunk_token_end = chunk_token_start + tokens_per_group
+                                    for position in range(
+                                        chunk_token_start, chunk_token_end, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
+                                    ):
+                                        if publish:
+                                            location = ttnn.experimental.disaggregation.KvCacheLocation()
+                                            location.noc_addr = (curr_bank_id << 32) | (base_addr + curr_bank_offset)
+                                            location.size_bytes = chunk_bytes
+                                            location.device_group_index = group_idx
+                                            table.set(global_layer, position, slot, location, config_id)
+
+                                        curr_bank_id = (curr_bank_id + 1) % num_banks
+                                        if curr_bank_id == 0:
+                                            curr_bank_offset += chunk_bytes
+        return table
+
+    def layout_model():
+        return m3_cache_layout_model(
             kv_cache=kv_cache,
             stage_layouts=stage_layouts,
             sp=sp,
@@ -262,99 +299,21 @@ def build_and_serialize_kv_chunk_table(
             head_dim=head_dim,
             index_k_layers=index_k_layers,
         )
-    except CacheLayoutNotDerivable as error:
-        not_derivable = str(error)
-    if os.getenv(LAYOUT_MODEL_ENV) == "1":
-        if model is None:
-            raise RuntimeError(f"{LAYOUT_MODEL_ENV}=1, but the M3 cache layout model is not derivable: {not_derivable}")
-        model_path = path + LAYOUT_MODEL_SUFFIX
-        disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
-        table = _derived_table(model, stage_layouts)
-        disaggregation.export_to_protobuf_file(table, path)
-        logger.info(
-            f"[migration] M3 KV chunk address table derived from its cache layout model ({model_path}) and "
-            f"serialized to {path} (configs={table.num_configs()}, stages={len(stage_layouts[0])}, "
-            f"layers={total_layers}, entries={table.total_entries()})"
-        )
-        return path
 
-    table = ttnn.experimental.disaggregation.KvChunkAddressTable(
-        {
-            config_name(i, len(specs)): _make_config(
-                num_layers=total_layers,
-                max_seq_len=seq_len,
-                num_users=num_users,
-                chunk_size_bytes=_chunk_size_bytes(dtype, head_dim),
-            )
-            for i, (_, _, _, dtype) in enumerate(specs)
-        }
+    hosts = [
+        (fid, _host_name(stage))
+        for layout in stage_layouts
+        for stage in layout
+        for row in stage["fnids"]
+        for fid in row
+    ]
+    publish_kv_chunk_table(
+        path=path, walk=walk, layout_model=layout_model, hosts=hosts, enable_env=LAYOUT_MODEL_ENV, model_name="M3"
     )
-
-    hosts_set = set()
-
-    for config_id, (label, tensor_idx, row_groups, dtype) in enumerate(specs):
-        chunk_bytes = _chunk_size_bytes(dtype, head_dim)
-        # Each group of a row owns an equal stripe of the row's per-chunk slab (the whole slab when the
-        # row has a single group).
-        tokens_per_group = tokens_per_chunk_local // len(row_groups)
-        for stage in stage_layouts[tensor_idx]:
-            base_addr = stage["base_addr"]
-            num_banks = stage["num_banks"]
-            host_name = _host_name(stage)
-            first = stage["first_layer"]
-            filter_layers = label == "index_k" and index_k_layers is not None
-            for global_row in range(sp):
-                for stripe, group_cols in enumerate(row_groups):
-                    fabric_node_ids = [stage["fnids"][global_row][c] for c in group_cols]
-                    group_idx = table.add_device_group(fabric_node_ids)
-                    for fid in fabric_node_ids:
-                        key = (int(fid.mesh_id), int(fid.chip_id))
-                        if key not in hosts_set:
-                            table.set_fabric_node_host(fid, host_name=host_name)
-                            hosts_set.add(key)
-
-                    # Replay the ND-shard ROUND_ROBIN_1D walk: 32-token blocks round-robin across the DRAM
-                    # banks (per chip / per tensor), advancing the per-bank offset after each full bank
-                    # sweep. The base address is identical on every chip (the tensor is allocated
-                    # identically everywhere), and each group's chips hold the same rows, so one walk per
-                    # group covers them. Each stage restarts the walk from ITS base address and writes at
-                    # the GLOBAL layer index; the slot fold on device is per-stage (slot * stage_count +
-                    # local_layer), which this slot -> local-layer order replays.
-                    curr_bank_id = 0
-                    curr_bank_offset = 0
-                    for slot in range(num_users):
-                        for local_layer in range(stage["count"]):
-                            global_layer = first + local_layer
-                            # A layer without index_k gets no rows, but still walks its region so later
-                            # layers keep their real addresses.
-                            publish = not filter_layers or global_layer in index_k_layers
-                            for seq_chunk in range(num_chunks_per_seq_len):
-                                chunk_token_start = (
-                                    seq_chunk * chunk_size
-                                    + global_row * tokens_per_chunk_local
-                                    + stripe * tokens_per_group
-                                )
-                                chunk_token_end = chunk_token_start + tokens_per_group
-                                for position in range(
-                                    chunk_token_start, chunk_token_end, NUM_CONTIGUOUS_TOKENS_IN_DRAM_BANK
-                                ):
-                                    if publish:
-                                        location = ttnn.experimental.disaggregation.KvCacheLocation()
-                                        location.noc_addr = (curr_bank_id << 32) | (base_addr + curr_bank_offset)
-                                        location.size_bytes = chunk_bytes
-                                        location.device_group_index = group_idx
-                                        table.set(global_layer, position, slot, location, config_id)
-
-                                    curr_bank_id = (curr_bank_id + 1) % num_banks
-                                    if curr_bank_id == 0:
-                                        curr_bank_offset += chunk_bytes
-
-    _check_layout_model(table, model, not_derivable, stage_layouts, path)
-    ttnn.experimental.disaggregation.export_to_protobuf_file(table, path)
     logger.info(
         f"[migration] M3 KV chunk address table serialized to {path} "
         f"(configs={len(specs)} [{', '.join(s[0] for s in specs)}], stages={len(stage_layouts[0])}, "
-        f"layers={total_layers}, entries={table.total_entries()}, index_k="
+        f"layers={total_layers}, index_k="
         f"{'TP-deduped (single-chip groups)' if index_k_tp_sharded else f'TP-replicated ({cols}-chip groups)'})"
     )
     return path

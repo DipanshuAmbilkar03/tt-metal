@@ -16,9 +16,9 @@ from types import SimpleNamespace
 import pytest
 
 import ttnn
+from models.demos.common.prefill.runners.cache_layout import LAYOUT_MODEL_SUFFIX
 from models.demos.minimax_m3.tt.attention.kv_cache import BH_NUM_DRAM_BANKS
 from models.demos.minimax_m3.tt.runners import kv_chunk_table
-from models.demos.minimax_m3.tt.runners.cache_layout import LAYOUT_MODEL_SUFFIX
 from models.demos.minimax_m3.tt.runners.kv_chunk_table import LAYOUT_MODEL_ENV, build_and_serialize_kv_chunk_table
 
 disaggregation = ttnn.experimental.disaggregation
