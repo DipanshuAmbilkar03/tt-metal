@@ -7,11 +7,13 @@ namespace ckernel::sfpu {
 struct SoftsignBf16Config {
     static constexpr uint32_t kBodySlots = 14u;
     static constexpr uint32_t kBoundExponent = 136u;
+    static constexpr uint32_t kLutSlopes = 0xb549b9a8u;
+    static constexpr uint32_t kLutIntercepts = 0x3c9f3ed4u;
     static constexpr bool kLateRound = true;
     static constexpr bool kRawNegativeInfinity = false;
 };
 }  // namespace ckernel::sfpu
-#include "sfpu/ckernel_sfpu_softsign_bf16_abs_denominator.h"
+#include "ckernel_sfpu_softsign_bf16_abs_denominator.h"
 
 namespace ckernel::sfpu {
 
@@ -41,7 +43,9 @@ __attribute__((noinline)) inline void calculate_softsign_bf16() {
     calculate_softsign_bf16_body<ITERATIONS>();
     sfpi::vConstFloatPrgm0 = __builtin_bit_cast(float, 0x3ea57ebbu);
 }
-// The call sets the constants it holds and puts stock's back, so the init leaves them to stock's.
-inline void init_softsign_bf16() {}
+inline void init_softsign_bf16() {
+    ckernel::sfpu::bf16::softsign::init_abs_denominator<ckernel::sfpu::SoftsignBf16Config>();
+    sfpi::vConstFloatPrgm0 = __builtin_bit_cast(float, 0x3ea57ebbu);
+}
 
 }  // namespace ckernel::sfpu

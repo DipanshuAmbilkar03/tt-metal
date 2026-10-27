@@ -17,6 +17,17 @@ constexpr std::uint32_t abs_denominator_wh_suffix_slots()
     return 5u + (LateRound ? 1u : 0u) + (RawNegativeInfinity ? 2u : 0u);
 }
 
+template <std::uint32_t Slopes, std::uint32_t Intercepts>
+inline void abs_denominator_lut_init()
+{
+    TTI_SFPLOADI(0, SFPLOADI_MOD0_USHORT, 0x80ff);
+    TTI_SFPCONFIG(0, 12, 0);
+    TTI_SFPLOADI(1, 2, Slopes & 0xffff);
+    TTI_SFPLOADI(1, 8, Slopes >> 16);
+    TTI_SFPLOADI(5, 2, Intercepts & 0xffff);
+    TTI_SFPLOADI(5, 8, Intercepts >> 16);
+}
+
 // RawNegativeInfinity keeps the raw word to return -Inf for a raw -Inf input;
 // without it every exponent-FF input returns +Inf, the stored NaN.
 template <std::uint32_t BoundExponent, bool LateRound, std::uint32_t Hold, bool RawNegativeInfinity = true>
