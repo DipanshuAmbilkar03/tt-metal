@@ -7,6 +7,7 @@
 #include "ckernel.h"
 #include "ckernel_defs.h"
 #include "ckernel_sfpu_cosh_bf16_hyperbolic_exp_core.h"
+#include "ckernel_sfpu_cosh_bf16_replay_window.h"
 #include "sfpi.h"
 
 namespace ckernel::sfpu::bf16::cosh
@@ -20,19 +21,18 @@ inline void calculate_hyperbolic_exp()
     ttpoly::cosh::hyperbolic_exp_pins<Config, false>();
     constexpr unsigned body_slots = Config::kOdd ? 29u : 32u;
     // Rows are addressed through ADDR_MOD_7 alone; the DEST counter steps one row past the replay.
-    load_replay_buf<Exec>(
-        0,
-        body_slots,
-        [&]
-        {
-            ttpoly::cosh::hyperbolic_exp_core<ADDR_MOD_7, ttpoly::cosh::HyperbolicC0<Config>, ttpoly::cosh::HyperbolicScale<Config>>();
-            ttpoly::cosh::hyperbolic_even_store<ADDR_MOD_7>();
-            TTI_INCRWC(0, 2, 0, 0);
-        });
+    auto row_head = [&] { ttpoly::cosh::hyperbolic_exp_core_head<ADDR_MOD_7, ttpoly::cosh::HyperbolicC0<Config>, ttpoly::cosh::HyperbolicScale<Config>>(); };
+    auto row_tail = [&]
+    {
+        ttpoly::cosh::hyperbolic_exp_core_tail<ADDR_MOD_7, ttpoly::cosh::HyperbolicC0<Config>, ttpoly::cosh::HyperbolicScale<Config>>();
+        ttpoly::cosh::hyperbolic_even_store<ADDR_MOD_7>();
+    };
+    record_split<0, body_slots, 16>(row_head, row_tail);
+    TTI_INCRWC(0, 2, 0, 0);
 #pragma GCC unroll 32
     for (int row = 1; row < Iterations; ++row)
     {
-        TTI_REPLAY(0, body_slots, 0, 0);
+        replay_split<0, body_slots, 16>(row_head, row_tail);
         TTI_INCRWC(0, 2, 0, 0);
     }
 }

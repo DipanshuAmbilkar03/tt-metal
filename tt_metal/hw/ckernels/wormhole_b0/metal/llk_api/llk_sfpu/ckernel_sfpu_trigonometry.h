@@ -14,8 +14,8 @@
 #include "ckernel_sfpu_sqrt_custom.h"
 #include "ckernel_sfpu_exp.h"
 #include "ckernel_sfpu_log1p.h"
-#include "sfpu/ckernel_sfpu_log.h"
-#include "sfpu/ckernel_sfpu_polyval.h"
+#include "ckernel_sfpu_log.h"
+#include "ckernel_sfpu_polyval.h"
 #include "sfpi.h"
 
 using namespace sfpi;
@@ -727,12 +727,21 @@ sfpi_inline sfpi::vFloat _sfpu_quarter_exp_abs_(sfpi::vFloat x) {
     return y;
 }
 
+bool bf16_dest_cosh();
+template <int ITERATIONS>
+void calculate_cosh_bf16();
 // Whether BF16 DEST runs the generated cosh kernel as one call over the whole tile.
-inline constexpr bool cosh_bf16_whole_tile = false;
+inline constexpr bool cosh_bf16_whole_tile = true;
 
 // t = exp(a); cosh(a) = 0.5 * (t + 1/t)
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en, int ITERATIONS>
 inline void calculate_cosh() {
+    if constexpr (!is_fp32_dest_acc_en && ITERATIONS == 32) {
+        if (bf16_dest_cosh()) {
+            calculate_cosh_bf16<ITERATIONS>();
+            return;
+        }
+    }
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat x = sfpi::dst_reg[0];
         sfpi::vFloat a = sfpi::setsgn(x, 0);
@@ -872,6 +881,8 @@ void tangent_init() {
     sfpi::vConstFloatPrgm2 = FRAC_2_PI;
 }
 
+void init_cosh_bf16();
+
 template <bool APPROXIMATION_MODE, bool is_fp32_dest_acc_en>
 void cosh_init() {
     math::reset_counters(p_setrwc::SET_ABD_F);
@@ -882,6 +893,9 @@ void cosh_init() {
     } else {
         sfpi::vConstFloatPrgm1 = -0.6931471805599453f;  // -ln(2)
         sfpi::vConstFloatPrgm2 = 0.500122011f;          // c2
+    }
+    if constexpr (!is_fp32_dest_acc_en) {
+        init_cosh_bf16();
     }
 }
 
@@ -1247,3 +1261,5 @@ void init_atanh() {
 }
 
 }  // namespace ckernel::sfpu
+
+#include "ckernel_sfpu_cosh_bf16.h"

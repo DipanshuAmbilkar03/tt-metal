@@ -49,9 +49,8 @@ struct HyperbolicNoReload
 // The compose scale multiplies at slot 29 from LREG11, which the caller pinned for the tile,
 // unless Scale names the LREG4 reload; C0 is then the c0 reload.
 template <std::uint32_t Hold, class C0 = HyperbolicNoReload, class Scale = HyperbolicNoReload>
-inline void hyperbolic_exp_core()
+inline void hyperbolic_exp_core_head()
 {
-    constexpr std::uint32_t scale = Scale::kReload ? ckernel::p_sfpu::LREG4 : ckernel::p_sfpu::LCONST_neg1;
     TTI_SFPLOAD(ckernel::p_sfpu::LREG0, 0, Hold, 0);                     // 1: x
     TTI_SFPSETSGN(0, ckernel::p_sfpu::LREG0, ckernel::p_sfpu::LREG0, 1); // 2: |x|
     TTI_SFPMAD(ckernel::p_sfpu::LREG0, ckernel::p_sfpu::LREG1, ckernel::p_sfpu::LREG7, ckernel::p_sfpu::LREG0,
@@ -74,7 +73,13 @@ inline void hyperbolic_exp_core()
     hyperbolic_gap<C0, 1>(); // 15: preserve L2 until the preceding Horner MAD retires
     TTI_SFPMAD(ckernel::p_sfpu::LREG6, ckernel::p_sfpu::LREG0, ckernel::p_sfpu::LREG3, ckernel::p_sfpu::LREG6,
                0); // 16
-    TTI_SFPNOP;    // 17: preserve L3 until the preceding Horner MAD retires
+}
+
+template <std::uint32_t Hold, class C0 = HyperbolicNoReload, class Scale = HyperbolicNoReload>
+inline void hyperbolic_exp_core_tail()
+{
+    constexpr std::uint32_t scale = Scale::kReload ? ckernel::p_sfpu::LREG4 : ckernel::p_sfpu::LCONST_neg1;
+    TTI_SFPNOP; // 17: preserve L3 until the preceding Horner MAD retires
     TTI_SFPMAD(ckernel::p_sfpu::LREG6, ckernel::p_sfpu::LREG0, ckernel::p_sfpu::LREG4, ckernel::p_sfpu::LREG0,
                0);               // 18: Horner c0
     TTI_SFPSHFT(0x017, 5, 5, 7); // 19: 2^i
