@@ -1455,7 +1455,7 @@ def test_sparse_mla_kv_push_prefetch_chain(
     chains = {False: _chain(False), True: _chain(True)}
     assert (
         chains[True][0][0]._push_prefetch is not None and chains[True][0][1]._push_prefetch is not None
-    ), "the push chain must prefetch (the sparse MLA overlap profile must be on)"
+    ), "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )
@@ -1573,7 +1573,7 @@ def test_sparse_mla_kv_push_prefetch_chain_padded(
     chains = {False: _chain(False), True: _chain(True)}
     assert (
         chains[True][0][0]._push_prefetch is not None and chains[True][0][1]._push_prefetch is not None
-    ), "the push chain must prefetch (the sparse MLA overlap profile must be on)"
+    ), "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )
@@ -1691,9 +1691,7 @@ def test_sparse_mla_kv_push_traced_metadata_slots(
         return layers, kvpe, index
 
     gather, push = _chain(False), _chain(True)
-    assert (
-        push[0][0]._push_prefetch is not None
-    ), "the push chain must prefetch (the sparse MLA overlap profile must be on)"
+    assert push[0][0]._push_prefetch is not None, "the push chain must prefetch"
     rope_tensors = RotarySetup(config, mesh_device, sp_axis=sp_axis, is_balanced=False).get_rope_tensors_indexed(
         total, chunk
     )

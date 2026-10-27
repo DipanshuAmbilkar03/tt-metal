@@ -472,6 +472,28 @@ class TT_CCL:
             self.sparse_kv_push = (SparseKvPushPlanner(self.mesh_device, links), *sems)
         return self.sparse_kv_push
 
+    def get_sparse_kv_push_grids(self, links: int, query_rows: int):
+        """(attention, push) core grids for sparse_sdpa with the next layer's push fused in.
+
+        Attention takes the fewest whole columns that keep its busiest core's token count minimal: cores past that
+        only add DRAM contention with the push. The push (2 senders + 1 fabric mux per link and direction) takes the
+        rows of the remaining columns furthest from the Ethernet row, where it contends less with attention.
+        """
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        push_cores = links * 4 * 3
+        tokens_per_core = -(-query_rows // (grid.x * grid.y - push_cores))
+        attention_cols = -(-(-(-query_rows // tokens_per_core)) // grid.y)
+        push_cols = grid.x - attention_cols
+        push_rows = -(-push_cores // push_cols) if push_cols > 0 else grid.y + 1
+        assert push_rows <= grid.y, f"no room for {push_cores} push cores beside attention on a {grid} grid"
+        attention = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(attention_cols - 1, grid.y - 1))]
+        )
+        push = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(attention_cols, grid.y - push_rows), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+        )
+        return attention, push
+
     def get_mla_sparse_kv_gather_buffer(self, *, seq_len, row_width, dtype, layout):
         """Return the full-capacity output scratch for sparse MLA's SP KV-prefix gather.
 

@@ -678,11 +678,10 @@ class ttMLA:
         self._sparse_mla_overlap = None
         # With the sparse KV push, a layer whose successor reuses the same top-k pushes that successor's prefix rows
         # during its own sparse_sdpa (attention and push on disjoint core grids of one program); the successor then
-        # pushes only its remainder. The core grids and semaphores are the overlap profile's.
+        # pushes only its remainder. The push has its own grids, independent of the overlap profile's gather grid.
         self._push_prefetch = None
         if (
             self._sparse_kv_push
-            and requested_overlap_profile is not None
             and self._has_indexer
             and not self.kv_only
             # layer_num counts this stage's cache slots, so compare the successor's LOCAL index: a pipeline
@@ -690,7 +689,9 @@ class ttMLA:
             and layer_idx - (first_layer_idx or 0) + 1 < self.layer_num
             and indexer_layer_is_reused(config, layer_idx + 1)
         ):
-            self._push_prefetch = self.tt_ccl.get_sparse_mla_overlap_resources(requested_overlap_profile)
+            self._push_prefetch = self.tt_ccl.get_sparse_kv_push_grids(
+                self.ccl_num_links, self.indexer_indices_shape()[2]
+            )
         if requested_overlap_profile is not None:
             if not self._has_indexer or self.kv_only or self._indexer_reuse:
                 # Only a non-kv-only full indexer layer can launch the two independent branches. Shared
@@ -2090,17 +2091,16 @@ class ttMLA:
 
     def _next_layer_prefetch(self, plan, kvpe_cache, cache_batch_idx, metadata=None):
         """sparse_sdpa arguments that fuse the next layer's prefix push into this layer's attention, or None."""
-        resources = self._push_prefetch
-        if resources is None or not self._sparse_kv_push:
+        if self._push_prefetch is None or not self._sparse_kv_push:
             return None
-        planner = self.tt_ccl.get_sparse_kv_push(self.ccl_num_links)[0]
+        attention_grid, push_grid = self._push_prefetch
+        planner, ready_sem, done_sem = self.tt_ccl.get_sparse_kv_push(self.ccl_num_links)
         nxt = self.layer_idx + 1
         buffer, _ = self._sparse_push_buffer(planner, kvpe_cache, nxt)
         planner.prefetched[nxt] = plan
         storage = kvpe_cache.storage
-        # Attention runs on the overlap profile's top-k grid; the push senders and fabric muxes on its gather grid.
         return dict(
-            sub_core_grids=resources.topk_core_grid,
+            sub_core_grids=attention_grid,
             push_input=storage,
             push_table=plan.table,
             push_output=buffer,
@@ -2109,9 +2109,9 @@ class ttMLA:
             # The next layer's slot: cache slots are user-major, so it is this slot + 1.
             **self._sparse_push_slot_kwargs(storage, cache_batch_idx + 1, metadata, prefix="push_"),
             push_num_links=self.ccl_num_links,
-            push_ready_semaphore=resources.ready_semaphore,
-            push_data_valid_semaphore=resources.data_valid_semaphore,
-            push_core_grid=resources.gather_core_grid,
+            push_ready_semaphore=ready_sem,
+            push_data_valid_semaphore=done_sem,
+            push_core_grid=push_grid,
         )
 
     def _prepare_sparse_kv_prefix(

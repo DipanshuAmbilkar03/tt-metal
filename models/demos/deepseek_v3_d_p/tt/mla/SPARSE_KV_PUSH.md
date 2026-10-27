@@ -34,10 +34,11 @@ Once per set of indices (the first shared layer after a full layer, or the full 
    bitwise equal to the dense path.
 
 **Overlap with attention.** A layer whose successor reuses its indices runs `sparse_sdpa` with the successor's
-prefix push fused in (`SparseSDPAPushFusedFactory`): attention on the overlap profile's top-k grid, the push senders
-and muxes on its gather grid, in one program. The prefix part holds rows written by earlier chunks; the successor
-then pushes the remainder (`part=2`, its own chunk's rows) before its attention. Without an overlap profile, a
-shared layer pushes all its rows itself (`part=0`).
+prefix push fused in (`SparseSDPAPushFusedFactory`): the push senders and muxes on the rows nearest the Ethernet row,
+attention on the rest, in one program (`TT_CCL.get_sparse_kv_push_grids`; separate from the overlap profile's
+full-layer gather grid). The prefix part holds rows written by earlier chunks; the successor then pushes the
+remainder (`part=2`, its own chunk's rows) before its attention. A shared layer nothing prefetched for pushes all its
+rows itself (`part=0`).
 
 **Buffers.** A chip's distinct rows are at most its query rows x top-k, so the push buffer is sized from the chunk at
 init (`SparseKvPushPlanner.buffer_rows`; 222 MiB at a 1M cache instead of 703 MiB), not from the cache. Layer L reads
