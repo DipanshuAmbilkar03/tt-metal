@@ -13,7 +13,7 @@
 #include "ttnn/device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 
-namespace ttnn::operations::experimental::high_bw_all_gather {
+namespace ttnn::operations::experimental::sparse_kv_push {
 
 // On-device plan for the sparse KV push. From one requester chip's top-k indices (natural positions in the
 // TP-deduped block-cyclic KVPE cache) it builds
@@ -85,7 +85,7 @@ struct SparsePushPlanDeviceOperation {
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-}  // namespace ttnn::operations::experimental::high_bw_all_gather
+}  // namespace ttnn::operations::experimental::sparse_kv_push
 
 namespace ttnn::prim {
 

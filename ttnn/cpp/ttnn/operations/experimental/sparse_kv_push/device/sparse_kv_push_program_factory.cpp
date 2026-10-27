@@ -2,34 +2,34 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "high_bw_sparse_push_factory.hpp"
+#include "sparse_kv_push_program_factory.hpp"
 
 #include <tt-metalium/host_api.hpp>
 #include "ttnn/operations/ccl/common/host/moe_utils.hpp"
 #include "sparse_push_program.hpp"
 
-namespace ttnn::operations::experimental::high_bw_all_gather {
+namespace ttnn::operations::experimental::sparse_kv_push {
 
 namespace {
 
 sparse_push::ReaderConfig reader_config(
-    const HighBwAllGatherParams& params, const HighBwAllGatherInputs& tensor_args, uint32_t num_devices) {
+    const SparseKvPushParams& params, const SparseKvPushInputs& tensor_args, uint32_t num_devices) {
     return sparse_push::ReaderConfig{
         .input = tensor_args.input_tensor,
-        .table = *tensor_args.push_table,
-        .batch_index_tensor = tensor_args.input_batch_index_tensor,
+        .table = tensor_args.table,
+        .batch_index_tensor = tensor_args.batch_index_tensor,
         .num_devices = num_devices,
-        .stripe_chunk = params.push_stripe_chunk,
-        .max_rows = params.push_max_rows,
-        .push_part = params.push_part};
+        .stripe_chunk = params.stripe_chunk,
+        .max_rows = params.max_rows,
+        .push_part = params.part};
 }
 
 }  // namespace
 
-HighBwSparsePushFactory::cached_mesh_workload_t HighBwSparsePushFactory::create_mesh_workload(
-    const HighBwAllGatherParams& operation_attributes,
+SparseKvPushProgramFactory::cached_mesh_workload_t SparseKvPushProgramFactory::create_mesh_workload(
+    const SparseKvPushParams& operation_attributes,
     const ttnn::MeshCoordinateRangeSet& tensor_coords,
-    const HighBwAllGatherInputs& tensor_args,
+    const SparseKvPushInputs& tensor_args,
     Tensor& output_tensor) {
     const auto& input_tensor = tensor_args.input_tensor;
     auto* mesh_device = input_tensor.device();
@@ -49,8 +49,7 @@ HighBwSparsePushFactory::cached_mesh_workload_t HighBwSparsePushFactory::create_
         output_tensor.buffer()->num_pages() == output_tensor.padded_shape()[2],
         "the sparse KV push needs one output page per compact-buffer row");
 
-    const auto layout = sparse_push::core_layout(
-        operation_attributes.resolved_worker_core_grid, operation_attributes.num_links.value_or(2));
+    const auto layout = sparse_push::core_layout(operation_attributes.core_grid, operation_attributes.num_links);
     const auto mux = sparse_push::mux_config(mesh_device);
     const auto defines = sparse_push::kernel_defines(mesh_device);
     const auto cfg = reader_config(operation_attributes, tensor_args, num_devices);
@@ -60,7 +59,7 @@ HighBwSparsePushFactory::cached_mesh_workload_t HighBwSparsePushFactory::create_
         cfg,
         operation_attributes.batch_slot_num_layers,
         operation_attributes.batch_slot_layer_idx,
-        operation_attributes.input_batch_index.value_or(0));
+        operation_attributes.batch_index);
     const uint32_t packet_bytes = sparse_push::pages_per_packet(page_bytes) * page_bytes;
 
     tt::tt_metal::distributed::MeshWorkload workload;
@@ -132,17 +131,17 @@ HighBwSparsePushFactory::cached_mesh_workload_t HighBwSparsePushFactory::create_
     return cached_mesh_workload_t{std::move(workload), std::move(shared_variables)};
 }
 
-void HighBwSparsePushFactory::override_runtime_arguments(
+void SparseKvPushProgramFactory::override_runtime_arguments(
     cached_mesh_workload_t& cached_workload,
-    const HighBwAllGatherParams& operation_attributes,
-    const HighBwAllGatherInputs& tensor_args,
+    const SparseKvPushParams& operation_attributes,
+    const SparseKvPushInputs& tensor_args,
     Tensor& output_tensor) {
     const uint32_t num_devices = tensor_args.input_tensor.device()->get_view().shape().mesh_size();
     const auto reader_common = sparse_push::reader_common_args(
         reader_config(operation_attributes, tensor_args, num_devices),
         operation_attributes.batch_slot_num_layers,
         operation_attributes.batch_slot_layer_idx,
-        operation_attributes.input_batch_index.value_or(0));
+        operation_attributes.batch_index);
     for (auto& [range, program] : cached_workload.workload.get_programs()) {
         auto& vars = cached_workload.shared_variables.at(range);
         auto& reader = tt::tt_metal::GetCommonRuntimeArgs(program, vars.reader_kernel_id);
@@ -156,4 +155,4 @@ void HighBwSparsePushFactory::override_runtime_arguments(
     }
 }
 
-}  // namespace ttnn::operations::experimental::high_bw_all_gather
+}  // namespace ttnn::operations::experimental::sparse_kv_push

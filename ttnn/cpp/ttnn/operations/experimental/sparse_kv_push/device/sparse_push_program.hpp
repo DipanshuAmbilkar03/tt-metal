@@ -2,10 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Program pieces of the sparse KV push shared by its two hosts: the standalone push (HighBwSparsePushFactory) and the
-// push fused into sparse_sdpa (SparseSDPAPushFusedFactory). Both run the same kernels on the same core layout:
-// one fabric channel per (link, direction), each with kSendersPerChannel sender cores (table reader + writer) feeding
-// one fabric mux core that owns the router connection.
+// Program pieces of the sparse KV push shared by its two hosts: the standalone push (SparseKvPushProgramFactory) and
+// the push fused into sparse_sdpa (SparseSDPAPushFusedFactory). Both run the same kernels on the same core layout: one
+// fabric channel per (link, direction), each with kSendersPerChannel sender cores (table reader + writer) feeding one
+// fabric mux core that owns the router connection.
 
 #pragma once
 
@@ -24,7 +24,7 @@
 #include "ttnn/tensor/tensor.hpp"
 #include "sparse_push_plan_device_operation.hpp"
 
-namespace ttnn::operations::experimental::high_bw_all_gather::sparse_push {
+namespace ttnn::operations::experimental::sparse_kv_push::sparse_push {
 
 constexpr uint32_t kDirections = 4;  // E, W, N, S (the eth_chan_directions order get_neighbors returns)
 constexpr uint32_t kSendersPerChannel = 2;
@@ -38,7 +38,7 @@ constexpr uint32_t kHeaderSlots = 1 + 4;  // semaphore increments + one per pack
 
 enum Cb : uint32_t { kData = 0, kMeta = 1, kTable = 2, kScalar = 3, kHeaders = 4 };
 
-constexpr const char* kKernelDir = "ttnn/cpp/ttnn/operations/experimental/high_bw_all_gather/device/kernels/";
+constexpr const char* kKernelDir = "ttnn/cpp/ttnn/operations/experimental/sparse_kv_push/device/kernels/";
 
 struct CircularBuffer {
     uint32_t id;
@@ -289,4 +289,4 @@ std::vector<uint32_t> mux_runtime_args(
         layout.muxes[channel]);
 }
 
-}  // namespace ttnn::operations::experimental::high_bw_all_gather::sparse_push
+}  // namespace ttnn::operations::experimental::sparse_kv_push::sparse_push

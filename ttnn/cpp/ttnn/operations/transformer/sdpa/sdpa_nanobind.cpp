@@ -429,9 +429,9 @@ void bind_sdpa(nb::module_& mod) {
                 sp_coord*tp + tp_coord), so stripes = sp*tp and per-stripe chunk = block_cyclic_chunk_local/tp.
             sub_core_grids (ttnn.CoreRangeSet, optional): restrict work to these cores (default: all cores of the
                 first subdevice). Part of the program-cache key.
-            push_*: when push_table is set, the next layer's sparse KV push of its prefix rows (high_bw_all_gather's
-                sparse push, part 1) runs in the same program on push_core_grid (disjoint from sub_core_grids, on a
-                2D torus fabric). push_input is the KVPE cache, push_batch_index its slot, push_table the
+            push_*: when push_table is set, the next layer's sparse KV push of its prefix rows (sparse_kv_push,
+                part 1) runs in the same program on push_core_grid (disjoint from sub_core_grids, on a 2D torus
+                fabric). push_input is the KVPE cache, push_batch_index its slot, push_table the
                 all-gathered sparse_push_plan tables, push_output the next layer's compact buffer.
                 push_batch_index_tensor (trace-safe) replaces push_batch_index with the slot read on device as
                 push_batch_index_tensor[0] * push_batch_slot_num_layers + push_batch_slot_layer_idx.

@@ -13,7 +13,7 @@
 
 namespace ttnn::prim {
 
-// A sparse KV push of the next layer's prefix rows (high_bw_all_gather's sparse push, part 1) fused into this op: its
+// A sparse KV push of the next layer's prefix rows (sparse_kv_push, part 1) fused into this op: its
 // reader/writer/mux kernels run on push_core_grid, disjoint from worker_core_grid, while attention runs.
 struct SparseSDPAFusedPush {
     uint32_t stripe_chunk = 0;

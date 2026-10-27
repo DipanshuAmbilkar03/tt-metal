@@ -2000,17 +2000,15 @@ class ttMLA:
         # When the previous layer's sparse_sdpa already pushed this plan's prefix rows (rows of earlier chunks), push
         # only the remainder: this chunk's own rows, just written above.
         prefetched = planner.prefetched.pop(self.layer_idx, None) is plan
-        compact = ttnn.experimental.high_bw_all_gather(
+        compact = ttnn.experimental.sparse_kv_push(
             storage,
-            dim=2,
             output_tensor=push_buffer,
-            cluster_axis=None,
+            table=plan.table,
+            stripe_chunk=plan.stripe_chunk,
+            max_rows=plan.max_rows,
+            part=2 if prefetched else 0,
             num_links=self.ccl_num_links,
             **self._sparse_push_slot_kwargs(storage, cache_batch_idx, metadata),
-            push_table=plan.table,
-            push_stripe_chunk=plan.stripe_chunk,
-            push_max_rows=plan.max_rows,
-            push_part=2 if prefetched else 0,
             ready_semaphore=ready_sem,
             data_valid_semaphore=done_sem,
         )
@@ -2031,15 +2029,12 @@ class ttMLA:
         recomposed on device as user * layer_num + layer: a host scalar would be frozen at capture time, so every
         replay would push the captured slot while the metadata-driven KV write lands in the live one."""
         if storage.shape[0] <= 1:
-            return {f"{prefix}batch_index": 0} if prefix else {"input_batch_index": None}
+            return {f"{prefix}batch_index": 0}
         if metadata is not None:
-            names = (
-                ("push_batch_index_tensor", "push_batch_slot_num_layers", "push_batch_slot_layer_idx")
-                if prefix
-                else ("input_batch_index_tensor", "batch_slot_num_layers", "batch_slot_layer_idx")
-            )
-            return dict(zip(names, (metadata[0], self.layer_num, cache_batch_idx % self.layer_num)))
-        return {f"{prefix}batch_index": cache_batch_idx} if prefix else {"input_batch_index": cache_batch_idx}
+            names = ("batch_index_tensor", "batch_slot_num_layers", "batch_slot_layer_idx")
+            values = (metadata[0], self.layer_num, cache_batch_idx % self.layer_num)
+            return {prefix + name: value for name, value in zip(names, values)}
+        return {f"{prefix}batch_index": cache_batch_idx}
 
     def _sparse_push_buffer(self, planner, kvpe_cache, layer_idx):
         """The compact buffer of `layer_idx`'s parity and its DRAM-aligned row page size."""

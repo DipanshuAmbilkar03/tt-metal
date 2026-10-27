@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // sparse_sdpa with a fused next-layer sparse KV push. The attention program is the plain sparse_sdpa one on
-// worker_core_grid; the push of the next layer's prefix rows (high_bw_all_gather's sparse push, part 1: rows written
-// by earlier chunks) is appended on push_core_grid, so the two overlap in one program. The next layer pushes the
-// rest (part 2: its own chunk's rows) before its attention.
+// worker_core_grid; the push of the next layer's prefix rows (sparse_kv_push, part 1: rows written by earlier chunks)
+// is appended on push_core_grid, so the two overlap in one program. The next layer pushes the rest (part 2: its own
+// chunk's rows) before its attention.
 
 #include "ttnn/operations/transformer/sdpa/device/sparse_sdpa_device_operation.hpp"
-#include "ttnn/operations/experimental/high_bw_all_gather/device/sparse_push_program.hpp"
+#include "ttnn/operations/experimental/sparse_kv_push/device/sparse_push_program.hpp"
 
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/program_descriptors.hpp>
@@ -20,7 +20,7 @@ namespace ttnn::prim {
 
 namespace {
 
-namespace sparse_push = ttnn::operations::experimental::high_bw_all_gather::sparse_push;
+namespace sparse_push = ttnn::operations::experimental::sparse_kv_push::sparse_push;
 
 // Kernel order in the fused program: sparse_sdpa's reader, writer, compute, then these.
 constexpr uint32_t kPushReaderKernel = 3, kPushWriterKernel = 4;

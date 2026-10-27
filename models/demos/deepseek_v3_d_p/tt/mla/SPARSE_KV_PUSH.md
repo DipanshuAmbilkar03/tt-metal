@@ -25,7 +25,7 @@ Once per set of indices (the first shared layer after a full layer, or the full 
    per-owner counts, per-owner counts before the chunk start) and the top-k rewritten to slots of a compact buffer.
    Table layout: `device/sparse_push_plan_device_operation.hpp`.
 2. **Table exchange**: `high_bw_all_gather` collects every chip's table on every chip.
-3. **Push** (`high_bw_all_gather(push_table=...)`, `HighBwSparsePushFactory`): each owner reads the requester's
+3. **Push** (`ttnn.experimental.sparse_kv_push`): each owner reads the requester's
    counts and bitmap over the blocks it owns and unicasts the needed rows straight into the requester's compact
    buffer, packed into bank-lane packets. One fabric channel per (link, direction), each with 2 senders behind a
    fabric mux; routes follow the fabric routing tables, with ring-distance ties split between both directions
@@ -36,9 +36,9 @@ Once per set of indices (the first shared layer after a full layer, or the full 
 **Overlap with attention.** A layer whose successor reuses its indices runs `sparse_sdpa` with the successor's
 prefix push fused in (`SparseSDPAPushFusedFactory`): attention on the overlap profile's top-k grid, the push senders
 and muxes on its gather grid, in one program. The prefix part holds rows written by earlier chunks; the successor
-then pushes the remainder (`push_part=2`, its own chunk's rows) before its attention. Compact buffers alternate by
+then pushes the remainder (`part=2`, its own chunk's rows) before its attention. Compact buffers alternate by
 layer parity, so layer L reads its buffer while L+1's fills. Without an overlap profile, a shared layer pushes all
-its rows itself (`push_part=0`).
+its rows itself (`part=0`).
 
 ## Trace safety
 

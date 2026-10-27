@@ -11,7 +11,6 @@
 #include "ttnn/operation.hpp"
 #include "high_bw_all_gather_device_operation_types.hpp"
 #include "high_bw_all_gather_fabric_factory.hpp"
-#include "high_bw_sparse_push_factory.hpp"
 
 namespace ttnn::operations::experimental::high_bw_all_gather {
 
@@ -21,7 +20,7 @@ struct HighBwAllGatherDeviceOperation {
     using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
     using topology_return_value_t = std::vector<tt::tt_metal::TensorTopology>;
-    using program_factory_t = std::variant<HighBwAllGatherFabricFactory, HighBwSparsePushFactory>;
+    using program_factory_t = std::variant<HighBwAllGatherFabricFactory>;
 
     // The selected batch slot and valid prefix are patched into kernel runtime arguments. Hash only
     // their presence, so a serving loop reuses one compiled program as either value changes.
@@ -79,11 +78,6 @@ Tensor high_bw_all_gather(
     const std::optional<Tensor>& gathered_prefix_tensor = std::nullopt,
     uint32_t gathered_slab_global = 0,
     const std::optional<GlobalSemaphore>& ready_semaphore = std::nullopt,
-    const std::optional<GlobalSemaphore>& data_valid_semaphore = std::nullopt,
-    // Sparse KV push (see HighBwSparsePushFactory).
-    const std::optional<Tensor>& push_table = std::nullopt,
-    uint32_t push_stripe_chunk = 0,
-    uint32_t push_max_rows = 0,
-    uint32_t push_part = 0);
+    const std::optional<GlobalSemaphore>& data_valid_semaphore = std::nullopt);
 
 }  // namespace ttnn::prim

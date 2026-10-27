@@ -255,20 +255,19 @@ def test_sparse_kv_push_real_topk_matches_gather(mesh_device, layer):
         **common,
     )
     ttnn.experimental.high_bw_all_gather(table, dim=2, output_tensor=tables, cluster_axis=None, num_links=links)
-    push_kw = dict(push_table=tables, push_stripe_chunk=stripe_chunk, push_max_rows=cache_tokens)
 
     def push(buf, slot, part):
-        return ttnn.experimental.high_bw_all_gather(
+        return ttnn.experimental.sparse_kv_push(
             cache,
-            dim=2,
             output_tensor=buf,
-            cluster_axis=None,
+            table=tables,
+            stripe_chunk=stripe_chunk,
+            max_rows=cache_tokens,
+            part=part,
             num_links=links,
-            input_batch_index=slot,
-            push_part=part,
+            batch_index=slot,
             ready_semaphore=sems[0],
             data_valid_semaphore=sems[1],
-            **push_kw,
         )
 
     # Layer L's buffer by one push of every row; layer L + 1's by its prefix fused into layer L's attention, then its

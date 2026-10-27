@@ -10,7 +10,7 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/work_split.hpp>
 
-namespace ttnn::operations::experimental::high_bw_all_gather {
+namespace ttnn::operations::experimental::sparse_kv_push {
 
 namespace plan_detail {
 
@@ -162,7 +162,7 @@ tt::tt_metal::ProgramDescriptor SparsePushPlanDeviceOperation::create_descriptor
         tt::tt_metal::TensorAccessorArgs(start_buf).append_to(ct);
     }
 
-    constexpr const char* kKernelDir = "ttnn/cpp/ttnn/operations/experimental/high_bw_all_gather/device/kernels/";
+    constexpr const char* kKernelDir = "ttnn/cpp/ttnn/operations/experimental/sparse_kv_push/device/kernels/";
     tt::tt_metal::KernelDescriptor kernel;
     kernel.kernel_source = std::string(kKernelDir) + "sparse_push_plan.cpp";
     kernel.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
@@ -224,7 +224,7 @@ tt::tt_metal::ProgramDescriptor SparsePushPlanDeviceOperation::create_descriptor
     return desc;
 }
 
-}  // namespace ttnn::operations::experimental::high_bw_all_gather
+}  // namespace ttnn::operations::experimental::sparse_kv_push
 
 namespace ttnn::prim {
 
@@ -236,7 +236,7 @@ std::vector<Tensor> sparse_push_plan(
     uint32_t pages_per_packet,
     uint32_t banks,
     const std::optional<Tensor>& chunk_start) {
-    using Op = ttnn::operations::experimental::high_bw_all_gather::SparsePushPlanDeviceOperation;
+    using Op = ttnn::operations::experimental::sparse_kv_push::SparsePushPlanDeviceOperation;
     return ttnn::device_operation::launch<Op>(
         Op::operation_attributes_t{
             .num_devices = num_devices,
