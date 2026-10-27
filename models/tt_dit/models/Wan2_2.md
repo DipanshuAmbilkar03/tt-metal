@@ -127,7 +127,8 @@ Both variants use the same MoE two-stage denoising architecture with separate hi
 ## Step caching (DBCache)
 
 The pipeline runs [cache-dit](https://github.com/vipshop/cache-dit) style **Dual Block Cache** step
-skipping **by default** (pass `cache_config=None` to `WanPipelineConfig.default` or to a call to disable it),
+skipping **by default on I2V** (T2V is uncached unless a `cache_config` is passed; pass `cache_config=None` to
+`WanPipelineConfig.default` or to a call to disable it on I2V),
 ported to TT-NN in `models/tt_dit/utils/dbcache.py` (decision logic) and
 `models/tt_dit/pipelines/wan/dbcache.py` (device buffers / tracers). On every denoising step the first
 `Fn` blocks are computed and the change they make to the hidden state is compared with the previous
@@ -140,9 +141,11 @@ independently, mirroring cache-dit's `has_separate_cfg=True` dual-transformer se
 from models.tt_dit.pipelines.wan.dbcache import WanDBCacheConfig
 from models.tt_dit.utils.dbcache import DBCacheConfig
 
-# Default (nothing to pass): cache-dit's Wan 2.2 preset, F1B0, threshold 0.12, <= 3 consecutive
-# cached steps, high-noise expert: 4 warmup steps / max 8 cached, low-noise expert: 2 warmup /
-# max 20 cached. See `WanDBCacheConfig.default` for the rationale.
+# Default (nothing to pass) on I2V: the standard recipe, cache-dit's Wan 2.2 preset with F1B0, threshold 0.12,
+# <= 2 consecutive cached steps, warmup at interval 2 (high-noise expert: 4 warmup steps / max 8 cached,
+# low-noise expert: 2 warmup / max 20 cached), TaylorSeer order 1 and separate CFG decisions: ~2x
+# end-to-end on 720p I2V. T2V is uncached by default (the recipe drifts there); pass a config to opt in.
+# See `WanDBCacheConfig.default` for the measurements.
 frames = pipeline(prompts=[...], num_inference_steps=40)
 
 # Uncached (the original single-trace path):
@@ -216,13 +219,19 @@ own Wan 2.2 example runs `flow_shift=3` (480p) / `5` (720p). Re-running 480p wit
 | 3 | F1, 0.08 | 28.4s (1.61x) | 4 / 12 | 21.5 dB | 0.952 |
 | 5, **720p** | F1, 0.08 | 93.8s vs 142.9s (1.52x) | 6 / 9 | 17.7 dB | 0.894 |
 
-End-to-end wall clock per video on BH Galaxy 4x8 with the defaults (`flow_shift=5`, threshold 0.08): 480p
+End-to-end wall clock per video on BH Galaxy 4x8 with cache-dit's threshold 0.08 (`flow_shift=5`): 480p
 29s (uncached 46s), 720p 95s (uncached 144s). Model load from the weight cache (~3 min) and mp4 export excluded.
 
 With cache-dit's schedule and threshold the low-noise expert caches 10 to 12 steps (including consecutive
-pairs) and the pipeline reaches 1.6x while staying near or above PCC 0.9, i.e. the GPU-class result. These
-are now the pipeline defaults; note that `flow_shift=5` changes the generated video relative to the official
-`flow_shift=12` schedule independently of caching.
+pairs) and the pipeline reaches 1.6x while staying near or above PCC 0.9, i.e. the GPU-class result. The
+pipeline defaults to `flow_shift=5` and, on I2V, to the standard recipe (threshold 0.12, <= 2 consecutive, warmup
+interval 2, TaylorSeer order 1, separate CFG decisions): 1.99x end-to-end on 720p I2V over ten image/prompt pairs
+at mean PCC 0.935 vs. the uncached video (8 H200s: 1.89x, PCC 0.943), and a blind review could not tell cached
+from uncached. T2V is uncached by default: the same recipe gives 1.88x on T2V but drifts to PCC 0.90 / 18.1 dB at
+480p and 0.71 / 13.4 dB at 720p. The quality setting is one override away on either pipeline:
+`WanDBCacheConfig.default(residual_diff_threshold=0.06, taylorseer_order=0, warmup_interval=1)` (PCC 0.98 on T2V
+and >= 0.99 on I2V at 1.3x). Note that `flow_shift=5`
+changes the generated video relative to the official `flow_shift=12` schedule independently of caching.
 
 The traced path (`traced=True`, three traces per expert) makes the same cache decisions and produces the same
 video as the untraced path (PCC 0.974 vs. the untraced baseline); the split-without-caching traced run is
@@ -230,7 +239,8 @@ bit-exact as well.
 
 At threshold 0.08 the video is still clean and coherent but follows a different trajectory (different
 choreography); at 0.05 it is visually the same video as the uncached run. TaylorSeer forecasting
-(`taylorseer_order=1/2`) did not improve agreement with the baseline in this setup and is off by default.
+(`taylorseer_order=1/2`) did not improve agreement with the baseline at 0.08 in this T2V setup; the default
+recipe runs order 1 as cache-dit's Wan 2.2 example does.
 The cached-step pattern is alternating (compute, cache, compute, ...) because the residual diff is measured
 against the last *computed* step. Multi-host (4x32) meshes are not supported yet: the residual-diff readback
 needs a host-side all-reduce.

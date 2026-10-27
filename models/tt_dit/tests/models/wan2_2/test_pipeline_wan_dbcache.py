@@ -73,7 +73,7 @@ def _pcc(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _parse_custom_config(name: str) -> WanDBCacheConfig:
-    """``custom:rdt=0.06&Fn=2&Bn=0&ts=1&mc=2&mcs=12&warm=4&cfgsep=0`` -> WanDBCacheConfig.
+    """``custom:rdt=0.06&Fn=2&Bn=0&ts=1&mc=2&wi=1&mcs=12&warm=4&cfgsep=0`` -> WanDBCacheConfig.
 
     ``mcs`` sets ``max_cached_steps`` on both experts (the preset caps high/low at 8/20 otherwise).
     """
@@ -96,6 +96,8 @@ def _parse_custom_config(name: str) -> WanDBCacheConfig:
             shared["taylorseer_order"] = int(v)
         elif k == "mc":
             shared["max_continuous_cached_steps"] = int(v)
+        elif k == "wi":
+            shared["warmup_interval"] = int(v)
         elif k == "cfgsep":
             shared["cfg_diff_compute_separate"] = bool(int(v))
         elif k == "mcs":
@@ -224,9 +226,13 @@ def test_wan_dbcache_ab(
         "baseline": None,
         # Same head/body/tail path as dbcache but never allowed to cache.
         "split_nocache": DBCacheConfig(residual_diff_threshold=0.0, max_warmup_steps=0),
-        # The shipped default preset (asserted on below); also what a call with no cache_config gets.
-        "dbcache": WanDBCacheConfig.default(**shared),
-        # Matrix: plain residual reuse vs. TaylorSeer forecasting orders, and the earlier 0.08 threshold.
+        # The T2V quality setting (gated below). T2V is uncached by default: the shipped preset is the
+        # I2V recipe, which drifts on T2V (PCC 0.90 at 480p, 0.71 at 720p) -> `dbcache_recipe`, ungated.
+        "dbcache": WanDBCacheConfig.default(
+            **{"residual_diff_threshold": 0.06, "taylorseer_order": 0, "warmup_interval": 1, **shared}
+        ),
+        "dbcache_recipe": WanDBCacheConfig.default(**shared),
+        # Matrix: plain residual reuse vs. TaylorSeer forecasting orders, and cache-dit's 0.08 threshold.
         "dbcache_ts0": WanDBCacheConfig.default(**shared, taylorseer_order=0),
         "dbcache_ts1": WanDBCacheConfig.default(**shared, taylorseer_order=1),
         "dbcache_ts2": WanDBCacheConfig.default(**shared, taylorseer_order=2),

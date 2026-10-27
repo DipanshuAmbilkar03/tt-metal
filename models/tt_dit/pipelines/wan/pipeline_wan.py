@@ -30,6 +30,7 @@ from models.tt_dit.utils import tensor
 from models.tt_dit.utils.conv3d import conv3d_configs
 from models.tt_dit.utils.dbcache import DBCacheConfig
 from models.tt_dit.utils.tensor import float32_tensor
+from models.tt_dit.utils.torch_threads import cap_torch_threads_to_half_the_cpus
 from models.tt_dit.utils.tracing import Tracer
 
 if TYPE_CHECKING:
@@ -155,8 +156,8 @@ class WanPipelineConfig:
 
     # DBCache (cache-dit style) step skipping, applied to every call unless the call passes its own
     # `cache_config` (``None`` disables caching for that call). `WanPipelineConfig.default` fills
-    # this with `WanDBCacheConfig.default()`; pass ``cache_config=None`` there to build an uncached
-    # pipeline.
+    # this with `WanDBCacheConfig.default()` (the I2V recipe) for ``model_type="i2v"`` and leaves T2V
+    # uncached; pass ``cache_config`` there explicitly to override either way.
     cache_config: WanDBCacheConfig | None = None
 
     @classmethod
@@ -215,7 +216,12 @@ class WanPipelineConfig:
             raise ValueError(msg)
 
         if cache_config is _UNSET:
-            cache_config = WanDBCacheConfig.default()
+            # The default recipe is validated on I2V only (T2V drifts past the A/B gate with it: PCC 0.90 at
+            # 480p and 0.71 at 720p, see `WanDBCacheConfig.default`), and the residual-diff readback is
+            # single-host only (`ExpertCacheRunner.read_sums`). T2V and multi-host meshes stay uncached
+            # unless the caller passes a cache_config explicitly.
+            i2v_single_host = model_type == "i2v" and not ttnn.using_distributed_env()
+            cache_config = WanDBCacheConfig.default() if i2v_single_host else None
 
         if dit_parallel_config is None or vae_parallel_config is None or encoder_parallel_config is None:
             sp_axis = preset["sp_axis"]
@@ -795,6 +801,13 @@ class WanPipeline(PipelineAPIMixin):
             self._last_cache_runners = []
             return None
         cache_config = WanDBCacheConfig.coerce(cache_config)
+        if ttnn.using_distributed_env() and (cache_config.high_noise.enabled or cache_config.low_noise.enabled):
+            # Fail before the first denoising step rather than at the first residual-diff readback.
+            msg = (
+                "DBCache is not supported on multi-host meshes (the residual-diff readback needs a host-side "
+                "all-reduce); build or call the pipeline with cache_config=None"
+            )
+            raise NotImplementedError(msg)
 
         runners = []
         for idx, ts in enumerate(self.transformer_states):
@@ -881,6 +894,7 @@ class WanPipeline(PipelineAPIMixin):
     DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"  # noqa: E501, RUF001
 
     @torch.no_grad()
+    @cap_torch_threads_to_half_the_cpus()
     def __call__(
         self,
         *,

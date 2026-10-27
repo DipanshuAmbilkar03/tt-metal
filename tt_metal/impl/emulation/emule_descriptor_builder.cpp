@@ -7,6 +7,7 @@
 // silicon's extraction 1:1 so the POD carries exactly what silicon feeds. Every consumer
 // (program_model / kernel_defines / metal2_emit / device_map / cb_dfb_setup) reads this POD.
 
+#include <filesystem>
 #include "emule_descriptor_builder.hpp"
 
 #include <optional>
@@ -268,9 +269,17 @@ EmuleProgramDescriptor build_emule_descriptor(Program& program, IDevice* device)
     auto& metal_context = MetalContext::instance(impl.get_context_id());
     const auto& rtoptions = MetalEnvAccessor(metal_context.get_env()).impl().get_rtoptions();
     std::string quasar_arch_include;
-    if (metal_context.get_cluster().arch() == tt::ARCH::QUASAR && !rtoptions.get_quasar_arch_variant().empty()) {
-        quasar_arch_include =
-            rtoptions.get_root_dir() + "tt_metal/tt-llk/tt_llk_quasar/arch/" + rtoptions.get_quasar_arch_variant();
+    if (metal_context.get_cluster().arch() == tt::ARCH::QUASAR) {
+        auto variant = metal_context.get_cluster().get_quasar_ip_variant();
+        const std::string lower_variant = [&]() {
+            std::string result = std::string(enchantum::to_string(variant));
+            std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+            return result;
+        }();
+        const std::string dir = rtoptions.get_root_dir() + "tt_metal/tt-llk/tt_llk_quasar/arch/" + lower_variant;
+        if (std::filesystem::is_directory(dir)) {
+            quasar_arch_include = dir;
+        }
     }
 
     EmuleProgramDescriptor pd;
@@ -423,6 +432,10 @@ EmuleProgramDescriptor build_emule_descriptor(Program& program, IDevice* device)
                     ScratchBinding{name, size_bytes, addr_crta_word, llk ? serialize_llk_metadata(*llk) : ""});
             });
             kd.bindings.crta_vararg_offset = k.get_crta_layout().vararg_section_offset;
+            k.process_tensor_binding_sequences([&kd](const std::string& name, const std::vector<std::string>& members) {
+                kd.bindings.tensor_sequences.push_back(TensorBindingSequence{name, members});
+            });
+            kd.bindings.compile_time_vararg_count = k.get_compile_time_vararg_count();
             for (const auto& r : k.core_range_set().ranges()) {
                 kd.core_ranges.push_back(
                     {static_cast<uint32_t>(r.start_coord.x),
