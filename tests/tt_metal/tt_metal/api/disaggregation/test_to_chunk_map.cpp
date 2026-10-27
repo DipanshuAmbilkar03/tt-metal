@@ -7,8 +7,13 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
+#include <string>
+#include <tuple>
+#include <variant>
 #include <vector>
 
+#include <fmt/format.h>
 #include <tt_stl/small_vector.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/core_coord.hpp>
@@ -22,6 +27,7 @@
 #include "internal/disaggregation/cache_tensor_layout_spec.hpp"
 #include "internal/disaggregation/noc_addr.hpp"
 #include "internal/disaggregation/to_chunk_map.hpp"
+#include "impl/internal/disaggregation/cache_layout_model_protobuf.hpp"
 
 namespace tt::tt_metal::internal::disaggregation {
 namespace {
@@ -409,6 +415,216 @@ TEST(ToChunkMap, CPU_GqaCyclicMatchesReference) {
         }
     }
     EXPECT_GT(checked, 0u);
+}
+
+// --- MiniMax-M3 prefill write layout (models/demos/minimax_m3/tt/runners/kv_chunk_table.py) ---
+// The prefill caches are [num_users * num_layers, 1, seq_len, head_dim] per chip, user-major. SP row r owns
+// tokens [n * chunk + r * chunk_local, + chunk_local) of each prefill chunk n; K/V head h lives on TP
+// column h, and index_k is replicated over the columns.
+constexpr uint32_t kPrefillSp = 2;
+constexpr uint32_t kPrefillCols = 4;  // == num_kv_heads
+constexpr uint32_t kPrefillHeadDim = 128;
+constexpr uint32_t kPrefillChunk = 128;  // chunk_local = 64 tokens: two DRAM blocks per row per chunk
+constexpr uint32_t kPrefillSeqLen = 256;
+constexpr uint32_t kPrefillUsers = 2;
+constexpr uint32_t kPrefillLayers = 3;
+constexpr uint64_t kPrefillKBase = 0x10000;
+constexpr uint64_t kPrefillVBase = 0x80000;
+constexpr uint64_t kPrefillIndexBase = 0xF0000;
+const std::vector<uint32_t> kPrefillIndexLayers = {0, 2};
+
+CacheLayoutModel m3_prefill_model() {
+    const TensorSpec tensor = make_bfp8_ndshard_spec(
+        Shape{kPrefillUsers * kPrefillLayers, 1, kPrefillSeqLen, kPrefillHeadDim},
+        Shape{1, 1, kTileLocal, kPrefillHeadDim});
+    GenerationPolicy policy;
+    policy.bank_scheme = BankScheme::Natural;
+    policy.bank_order = BankOrder::Identity;
+    policy.k_chunk_size = KChunkSize{kTileLocal};
+    policy.device_chunk_size = DeviceChunkSize{kPrefillChunk / kPrefillSp};
+    const KvLayoutSpec spec{.tensor = tensor, .temporal = temporal::Dense{}, .arch = tt::ARCH::BLACKHOLE};
+
+    CacheLayoutModel model;
+    auto head_config = [&](uint32_t id, uint32_t head, uint64_t base) {
+        std::vector<MeshCoordinate> coords;
+        for (uint32_t r = 0; r < kPrefillSp; ++r) {
+            coords.emplace_back(r, head);
+        }
+        return CacheConfig{
+            .spec = spec,
+            .topology = TensorTopology(MeshShape{kPrefillSp}, {MeshMapperConfig::Shard{.dim = 2}}, coords),
+            .policy = policy,
+            .base_addr = base,
+            .name = fmt::format("{:02d}", id)};
+    };
+    for (uint32_t h = 0; h < kPrefillCols; ++h) {
+        model.caches.push_back(head_config(h, h, kPrefillKBase));
+    }
+    for (uint32_t h = 0; h < kPrefillCols; ++h) {
+        model.caches.push_back(head_config(kPrefillCols + h, h, kPrefillVBase));
+    }
+    model.caches.push_back(CacheConfig{
+        .spec = spec,
+        .topology = TensorTopology(
+            MeshShape{kPrefillSp, kPrefillCols},
+            {MeshMapperConfig::Shard{.dim = 2}, MeshMapperConfig::Replicate{}},
+            row_major_coords(kPrefillSp, kPrefillCols)),
+        .policy = policy,
+        .base_addr = kPrefillIndexBase,
+        .name = fmt::format("{:02d}", 2 * kPrefillCols),
+        .layers = kPrefillIndexLayers});
+    model.mesh_shape = MeshShape{kPrefillSp, kPrefillCols};
+    model.geometry = MapGeometry{
+        .num_layers = kPrefillLayers,
+        .num_slots = kPrefillUsers,
+        .max_seq_len = kPrefillSeqLen,
+        .position_step = kTileLocal};
+    return model;
+}
+
+// The prefill writer's walk for one SP row: 32-token blocks round-robin over the banks, the per-bank
+// offset advancing after each full sweep, in slot -> layer -> chunk -> block order. Keyed by
+// (layer, position, slot); the value is (bank, per-bank offset).
+std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>> m3_prefill_walk(
+    uint32_t row, uint64_t base) {
+    const uint32_t chunk_local = kPrefillChunk / kPrefillSp;
+    const uint32_t chunk_bytes = (kPrefillHeadDim / kTileLocal) * kBfp8TileBytesLocal;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::pair<uint32_t, uint64_t>> walk;
+    uint32_t bank = 0;
+    uint64_t offset = 0;
+    for (uint32_t slot = 0; slot < kPrefillUsers; ++slot) {
+        for (uint32_t layer = 0; layer < kPrefillLayers; ++layer) {
+            for (uint32_t n = 0; n < kPrefillSeqLen / kPrefillChunk; ++n) {
+                const uint32_t start = n * kPrefillChunk + row * chunk_local;
+                for (uint32_t pos = start; pos < start + chunk_local; pos += kTileLocal) {
+                    walk[{layer, pos, slot}] = {bank, base + offset};
+                    bank = (bank + 1) % kNumBanks;
+                    if (bank == 0) {
+                        offset += chunk_bytes;
+                    }
+                }
+            }
+        }
+    }
+    return walk;
+}
+
+void expect_m3_prefill_table(const KvChunkAddressTable& table) {
+    ASSERT_EQ(table.num_configs(), 2 * kPrefillCols + 1);
+    for (uint32_t cfg = 0; cfg < table.num_configs(); ++cfg) {
+        EXPECT_EQ(table.config_name(cfg), fmt::format("{:02d}", cfg));
+    }
+    uint32_t checked = 0;
+    for (uint32_t cfg = 0; cfg < table.num_configs(); ++cfg) {
+        const bool index_k = cfg == 2 * kPrefillCols;
+        const uint32_t head = cfg % kPrefillCols;
+        const uint64_t base = index_k ? kPrefillIndexBase : (cfg < kPrefillCols ? kPrefillKBase : kPrefillVBase);
+        for (uint32_t row = 0; row < kPrefillSp; ++row) {
+            for (const auto& [key, expected] : m3_prefill_walk(row, base)) {
+                const auto& [layer, pos, slot] = key;
+                const KvCacheLocation loc = table.lookup(layer, pos, slot, cfg);
+                if (index_k && !std::binary_search(kPrefillIndexLayers.begin(), kPrefillIndexLayers.end(), layer)) {
+                    EXPECT_EQ(loc.size_bytes, 0u) << "unpublished index_k layer " << layer << " has a row";
+                    continue;
+                }
+                EXPECT_EQ(loc.size_bytes, (kPrefillHeadDim / kTileLocal) * kBfp8TileBytesLocal);
+                EXPECT_EQ(addr_channel(loc.noc_addr), expected.first) << "cfg=" << cfg << " pos=" << pos;
+                EXPECT_EQ(addr_local(loc.noc_addr), static_cast<uint32_t>(expected.second))
+                    << "cfg=" << cfg << " layer=" << layer << " slot=" << slot << " pos=" << pos;
+                const auto& group = table.get_device_group(loc.device_group_index);
+                if (index_k) {
+                    ASSERT_EQ(group.fabric_node_ids.size(), kPrefillCols);
+                    for (uint32_t c = 0; c < kPrefillCols; ++c) {
+                        EXPECT_EQ(group.fabric_node_ids[c].chip_id, row * kPrefillCols + c);
+                    }
+                } else {
+                    ASSERT_EQ(group.fabric_node_ids.size(), 1u);
+                    EXPECT_EQ(group.fabric_node_ids[0].chip_id, row * kPrefillCols + head);
+                }
+                ++checked;
+            }
+        }
+    }
+    const uint32_t positions = kPrefillSeqLen / kTileLocal;
+    EXPECT_EQ(checked, (2 * kPrefillCols * kPrefillLayers + kPrefillIndexLayers.size()) * kPrefillUsers * positions);
+}
+
+TEST(ToChunkMap, CPU_M3PrefillMatchesTheWritersBankWalk) { expect_m3_prefill_table(to_chunk_map(m3_prefill_model())); }
+
+TEST(ToChunkMap, CPU_FoldedLayersNeedTheNaturalIdentityLayout) {
+    CacheLayoutModel model = m3_prefill_model();
+    model.caches.front().policy.bank_order = BankOrder::Optimal;
+    EXPECT_ANY_THROW(to_chunk_map(model));
+}
+
+TEST(ToChunkMap, CPU_ConfigNamesAreAllSetOrAllEmpty) {
+    CacheLayoutModel model = m3_prefill_model();
+    model.caches.back().name.clear();
+    EXPECT_ANY_THROW(to_chunk_map(model));
+}
+
+TEST(ToChunkMap, CPU_PublishedLayersMustBeAscendingAndInRange) {
+    CacheLayoutModel model = m3_prefill_model();
+    model.caches.back().layers = {2, 0};
+    EXPECT_ANY_THROW(to_chunk_map(model));
+    model.caches.back().layers = {0, kPrefillLayers};
+    EXPECT_ANY_THROW(to_chunk_map(model));
+}
+
+TEST(CacheLayoutModel, CPU_RoundTripsThroughProtobufToTheSameTable) {
+    const CacheLayoutModel model = m3_prefill_model();
+    const CacheLayoutModel imported = import_cache_layout_model_from_protobuf(export_to_protobuf(model));
+
+    ASSERT_EQ(imported.caches.size(), model.caches.size());
+    for (size_t i = 0; i < model.caches.size(); ++i) {
+        const CacheConfig& want = model.caches[i];
+        const CacheConfig& got = imported.caches[i];
+        EXPECT_EQ(got.name, want.name);
+        EXPECT_EQ(got.layers, want.layers);
+        EXPECT_EQ(got.base_addr, want.base_addr);
+        EXPECT_EQ(got.spec.tensor, want.spec.tensor);
+        EXPECT_EQ(got.spec.arch, want.spec.arch);
+        EXPECT_TRUE(std::holds_alternative<temporal::Dense>(got.spec.temporal));
+        EXPECT_EQ(got.topology, want.topology);
+        EXPECT_EQ(got.policy.bank_scheme, want.policy.bank_scheme);
+        EXPECT_EQ(got.policy.bank_order, want.policy.bank_order);
+        EXPECT_EQ(got.policy.k_chunk_size, want.policy.k_chunk_size);
+        EXPECT_EQ(got.policy.device_chunk_size, want.policy.device_chunk_size);
+    }
+    EXPECT_EQ(*imported.mesh_id, *model.mesh_id);
+    EXPECT_EQ(imported.mesh_shape, model.mesh_shape);
+    EXPECT_EQ(imported.geometry.num_layers, model.geometry.num_layers);
+    EXPECT_EQ(imported.geometry.num_slots, model.geometry.num_slots);
+    EXPECT_EQ(imported.geometry.max_seq_len, model.geometry.max_seq_len);
+    EXPECT_EQ(imported.geometry.position_step, model.geometry.position_step);
+    expect_m3_prefill_table(to_chunk_map(imported));
+}
+
+TEST(CacheLayoutModel, CPU_EveryTemporalPolicyRoundTrips) {
+    const std::vector<TemporalPolicy> policies = {
+        temporal::Dense{},
+        temporal::Window{WindowTokens{128}},
+        temporal::BlockLocal{BlockLocalSpan{8192}},
+        temporal::Rolling{},
+        temporal::Static{},
+        temporal::None{}};
+    for (const TemporalPolicy& policy : policies) {
+        CacheLayoutModel model = m3_prefill_model();
+        model.caches.front().spec.temporal = policy;
+        const TemporalPolicy got =
+            import_cache_layout_model_from_protobuf(export_to_protobuf(model)).caches.front().spec.temporal;
+        ASSERT_EQ(got.index(), policy.index());
+        if (const auto* window = std::get_if<temporal::Window>(&policy)) {
+            EXPECT_EQ(std::get<temporal::Window>(got).width, window->width);
+        }
+        if (const auto* local = std::get_if<temporal::BlockLocal>(&policy)) {
+            EXPECT_EQ(std::get<temporal::BlockLocal>(got).span, local->span);
+        }
+    }
+}
+
+TEST(CacheLayoutModel, CPU_RejectsBytesThatAreNotAModel) {
+    EXPECT_ANY_THROW(import_cache_layout_model_from_protobuf(std::string("\xff\xff\xff", 3)));
 }
 
 }  // namespace

@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -47,6 +49,7 @@ struct Derived {
     uint32_t n_heads_per_dev = 1;
     uint32_t num_banks = 0;             // set from num_dram_banks(arch) in derive()
     std::vector<uint32_t> banks;        // resolved bank permutation (arch + bank_order), size num_banks
+    bool layers_folded = false;         // batch axis holds num_slots * num_layers rows, user-major
 };
 
 // The active bank ordering resolved for the cache's arch: the OPTIMAL permutation or the identity
@@ -141,6 +144,7 @@ Located locate_one(
     const GenerationPolicy& policy,
     const Derived& d,
     std::optional<uint32_t> head,
+    uint32_t layer,
     uint32_t position,
     uint32_t slot,
     uint64_t base,
@@ -223,9 +227,8 @@ Located locate_one(
     const uint32_t csb = chunk_size_bytes(spec.tensor, tpc);
     const uint32_t tpc_page = kcs;
     if (policy.bank_order == BankOrder::Identity) {
-        const uint32_t pages_per_slot = geom.num_slots > 1 ? (per_dev_seq / tpc_page) : 0;
-        const uint32_t eff_slot = pages_per_slot > 0 ? slot : 0;
-        const uint32_t page_id = eff_slot * pages_per_slot + local_pos / tpc_page;
+        const uint32_t row = d.layers_folded ? slot * geom.num_layers + layer : slot;
+        const uint32_t page_id = row * (per_dev_seq / tpc_page) + local_pos / tpc_page;
         const uint32_t in_page_offset = (local_pos % tpc_page) * (csb / tpc_page);
         const uint32_t bank_id = page_id % d.num_banks;
         const uint64_t off = base + static_cast<uint64_t>(page_id / d.num_banks) * csb + in_page_offset;
@@ -272,12 +275,30 @@ KvChunkAddressTable to_chunk_map(
     const MeshShape& mesh_shape,
     const MapGeometry& geometry) {
     TT_FATAL(!configs.empty(), "to_chunk_map requires at least one cache config");
+    const bool named = !configs.front().name.empty();
 
     std::vector<Derived> derived;
     derived.reserve(configs.size());
     std::vector<KvChunkAddressTableConfig> table_configs;
     for (const auto& config : configs) {
-        const Derived d = derive(config);
+        TT_FATAL(config.name.empty() != named, "to_chunk_map: cache config names must be all empty or all set");
+        TT_FATAL(
+            std::is_sorted(config.layers.begin(), config.layers.end()) &&
+                std::adjacent_find(config.layers.begin(), config.layers.end()) == config.layers.end() &&
+                (config.layers.empty() || config.layers.back() < geometry.num_layers),
+            "to_chunk_map: cache '{}' publishes layers that are not ascending, distinct and below {}",
+            config.name,
+            geometry.num_layers);
+        Derived d = derive(config);
+        d.layers_folded = geometry.num_layers > 1 &&
+                          config.spec.tensor.logical_shape()[0] == geometry.num_slots * geometry.num_layers;
+        const bool identity_natural =
+            config.policy.bank_scheme == BankScheme::Natural && config.policy.bank_order == BankOrder::Identity;
+        TT_FATAL(
+            !d.layers_folded || identity_natural,
+            "to_chunk_map: cache '{}' folds its layers into the batch axis, which only the Natural scheme with "
+            "the Identity bank order addresses",
+            config.name);
         derived.push_back(d);
         table_configs.push_back(KvChunkAddressTableConfig{
             .num_layers = geometry.num_layers,
@@ -288,7 +309,15 @@ KvChunkAddressTable to_chunk_map(
         });
     }
 
-    KvChunkAddressTable table{std::span<const KvChunkAddressTableConfig>(table_configs)};
+    std::map<std::string, KvChunkAddressTableConfig> by_name;
+    for (uint32_t cfg = 0; named && cfg < configs.size(); ++cfg) {
+        TT_FATAL(
+            by_name.emplace(configs[cfg].name, table_configs[cfg]).second,
+            "to_chunk_map: two cache configs are named '{}'",
+            configs[cfg].name);
+    }
+    KvChunkAddressTable table = named ? KvChunkAddressTable{by_name}
+                                      : KvChunkAddressTable{std::span<const KvChunkAddressTableConfig>(table_configs)};
 
     for (uint32_t cfg = 0; cfg < configs.size(); ++cfg) {
         const CacheConfig& config = configs[cfg];
@@ -296,6 +325,7 @@ KvChunkAddressTable to_chunk_map(
         const GenerationPolicy& policy = config.policy;
         const Derived& d = derived[cfg];
         const bool per_head = d.head_axis.has_value();
+        const uint32_t table_config = named ? table.config_id_of(config.name) : cfg;
 
         uint32_t extent = geometry.max_seq_len;
         if (const auto* w = std::get_if<temporal::Window>(&spec.temporal)) {
@@ -305,11 +335,17 @@ KvChunkAddressTable to_chunk_map(
         }
 
         for (uint32_t layer = 0; layer < geometry.num_layers; ++layer) {
+            const bool published =
+                config.layers.empty() || std::binary_search(config.layers.begin(), config.layers.end(), layer);
+            if (!published) {
+                continue;
+            }
             for (uint32_t h = 0; h < d.n_heads; ++h) {
                 const std::optional<uint32_t> head = per_head ? std::optional<uint32_t>(h) : std::nullopt;
                 for (uint32_t slot = 0; slot < geometry.num_slots; ++slot) {
                     for (uint32_t pos = 0; pos < extent && pos < geometry.max_seq_len; pos += geometry.position_step) {
-                        const Located loc = locate_one(spec, policy, d, head, pos, slot, config.base_addr, geometry);
+                        const Located loc =
+                            locate_one(spec, policy, d, head, layer, pos, slot, config.base_addr, geometry);
                         const DeviceGroupIndex grp =
                             table.add_device_group(device_group(config.topology, d, loc, mesh_id, mesh_shape));
                         const uint64_t noc_addr = (static_cast<uint64_t>(loc.bank_id) << 32) | addr_local(loc.offset);
@@ -322,7 +358,7 @@ KvChunkAddressTable to_chunk_map(
                                 .noc_addr = noc_addr,
                                 .size_bytes = table_configs[cfg].chunk_size_bytes,
                                 .device_group_index = grp},
-                            cfg);
+                            table_config);
                     }
                 }
             }
@@ -330,6 +366,10 @@ KvChunkAddressTable to_chunk_map(
     }
 
     return table;
+}
+
+KvChunkAddressTable to_chunk_map(const CacheLayoutModel& model) {
+    return to_chunk_map(model.caches, model.mesh_id, model.mesh_shape, model.geometry);
 }
 
 }  // namespace tt::tt_metal::internal::disaggregation
