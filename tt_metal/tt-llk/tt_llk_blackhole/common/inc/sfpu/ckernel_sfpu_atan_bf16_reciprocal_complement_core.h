@@ -4,6 +4,8 @@
 
 // Selected reciprocal coordinate and reconstruction. Callers retain terminals,
 // coefficient ownership, rounding and traversal.
+#include <cstdint>
+
 namespace ckernel::sfpu::ttpoly::atan
 {
 using namespace ::sfpi;
@@ -62,14 +64,17 @@ inline void reciprocal_complement_short_rung()
         reciprocal_complement_short_rung<Config, J + 1u>();
     }
 }
-
 // LoadMacro false issues what the load macro schedules (init_reciprocal_complement) as plain instructions,
 // for builds without SFPLOADMACRO.
 // Held false reads the two leading coefficients from vConstFloatPrgm1/Prgm2, which the caller's init
 // programs; Held true loads them in the row (reciprocal_complement_held_slots more slots), into LREG2 and
 // LREG3, both dead between the reduction's swap and the first Horner MAD.
+// The slots reciprocal_complement_body_head issues: the part of the row a window too short for all of it records.
 template <class Config, unsigned Hold, unsigned Advance, bool LoadMacro = true, bool Held = false>
-inline void reciprocal_complement_body()
+inline constexpr std::uint32_t reciprocal_complement_body_head_slots = 11u + ((Held) ? 5u : 1u);
+
+template <class Config, unsigned Hold, unsigned Advance, bool LoadMacro = true, bool Held = false>
+inline void reciprocal_complement_body_head()
 {
     static_assert(!Held || Config::kDegree != 8, "the degree-eight row has no free replay slot");
     TTI_SFPLOAD(0, 0, Hold, 0);
@@ -95,6 +100,11 @@ inline void reciprocal_complement_body()
     {
         TTI_SFPMAD(13, 1, 14, 2, 0);
     }
+}
+
+template <class Config, unsigned Hold, unsigned Advance, bool LoadMacro = true, bool Held = false>
+inline void reciprocal_complement_body_tail()
+{
     reciprocal_complement_short_rung<Config, 0>();
     TTI_SFPSETCC(0, 0, 0, 0);
     TTI_SFPMAD(ckernel::p_sfpu::LCONST_neg1, 2, 4, 2, 0);
@@ -112,5 +122,12 @@ inline void reciprocal_complement_body()
         TTI_SFP_STOCH_RND(SFPSTOCHRND_RND_EVEN, 0, 0, 3, 3, SFPSTOCHRND_MOD1_FP32_TO_FP16B);
         TTI_SFPSTORE(3, 0, Advance, 0);
     }
+}
+
+template <class Config, unsigned Hold, unsigned Advance, bool LoadMacro = true, bool Held = false>
+inline void reciprocal_complement_body()
+{
+    reciprocal_complement_body_head<Config, Hold, Advance, LoadMacro, Held>();
+    reciprocal_complement_body_tail<Config, Hold, Advance, LoadMacro, Held>();
 }
 } // namespace ckernel::sfpu::ttpoly::atan

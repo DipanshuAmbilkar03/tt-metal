@@ -29,10 +29,10 @@ inline bool bf16_dest_atan() {
     return false;
 #endif
 }
-// Each call records replay slots 0-25, overwriting what an init recorded there (matmul and reduce
-// record from replay_buf_offset = 16).
+// Each call records replay slots 0-15, below replay_buf_offset = 16, where matmul and
+// reduce record.
 template <int ITERATIONS = 32>
-inline void calculate_atan_bf16() {
+__attribute__((noinline)) inline void calculate_atan_bf16() {
     ckernel::sfpu::bf16::atan::calculate_reciprocal_complement<ckernel::sfpu::AtanBf16Config, ITERATIONS>();
 }
 inline void init_atan_bf16() { ckernel::sfpu::bf16::atan::init_reciprocal_complement<ckernel::sfpu::AtanBf16Config>(); }

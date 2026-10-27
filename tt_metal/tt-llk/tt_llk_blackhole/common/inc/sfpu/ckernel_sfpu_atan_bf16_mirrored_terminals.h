@@ -8,7 +8,7 @@ using namespace ::sfpi;
 using ::sfpi::DataLayout;
 
 template <int CODE>
-inline vFloat target_raw_terminal_value(vFloat computed, float constant = 0.0f)
+__attribute__((always_inline)) inline vFloat target_raw_terminal_value(vFloat computed, float constant = 0.0f)
 {
     static_assert(CODE >= 0 && CODE <= 6, "unsupported raw terminal class");
     if constexpr (CODE == 0)

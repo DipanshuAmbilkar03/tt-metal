@@ -8,6 +8,7 @@
 #include "ckernel_defs.h"
 #include "ckernel_sfpu_atan_bf16_mirrored_terminals.h"
 #include "ckernel_sfpu_atan_bf16_reciprocal_complement_core.h"
+#include "ckernel_sfpu_atan_bf16_replay_window.h"
 #include "sfpi.h"
 
 namespace ckernel::sfpu::bf16::atan
@@ -84,18 +85,16 @@ inline void calculate_reciprocal_complement()
         TTI_INCRWC(0, 2, 0, 0);
     }
 #else
-    load_replay_buf<Exec>(
-        0,
-        Config::kBodySlots + ttpoly::atan::reciprocal_complement_held_slots,
-        [&]
-        {
-            ttpoly::atan::reciprocal_complement_body<Config, ADDR_MOD_7, ADDR_MOD_7, true, true>();
-            TTI_INCRWC(0, 2, 0, 0);
-        });
+    constexpr std::uint32_t slots = Config::kBodySlots + ttpoly::atan::reciprocal_complement_held_slots;
+    constexpr std::uint32_t head  = ttpoly::atan::reciprocal_complement_body_head_slots<Config, ADDR_MOD_7, ADDR_MOD_7, true, true>;
+    auto row_head                 = [&] { ttpoly::atan::reciprocal_complement_body_head<Config, ADDR_MOD_7, ADDR_MOD_7, true, true>(); };
+    auto row_tail                 = [&] { ttpoly::atan::reciprocal_complement_body_tail<Config, ADDR_MOD_7, ADDR_MOD_7, true, true>(); };
+    record_split<0, slots, head>(row_head, row_tail);
+    TTI_INCRWC(0, 2, 0, 0);
 #pragma GCC unroll 8
     for (int d = 1; d < 32; ++d)
     {
-        TTI_REPLAY(0, Config::kBodySlots + ttpoly::atan::reciprocal_complement_held_slots, 0, 0);
+        replay_split<0, slots, head>(row_head, row_tail);
         TTI_INCRWC(0, 2, 0, 0);
     }
     TTI_SFPNOP;
