@@ -58,7 +58,9 @@
 //       ./build/test/ttnn/multiprocess/unit_tests_cross_process_d2d
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -147,7 +149,7 @@ const CoreRange kWorkerCores{CoreCoord{0, 0}, CoreCoord{0, 0}};  // single worke
 // exercised (consumed_sem mcast to N cores, data_ready reaching N acks, page split).
 const CoreRange kStressWorkerCores{CoreCoord{0, 0}, CoreCoord{1, 1}};  // 2x2 = 4 worker cores
 constexpr uint32_t kStressIncsPerConn = 4u;  // atomic-inc packets sent per fabric connection per iter
-constexpr uint32_t kFillBase = 1u;  // stage-0 source iota base; end stage verifies kFillBase + iter
+constexpr uint32_t kFillBase = 1u;           // stage-0 source iota base; end stage verifies kFillBase + iter
 // ForwardChainStress carries a per-ITERATION random increment THROUGH the metadata
 // path instead of a kernel arg: stage 0 injects metadata[i] as H2D metadata, each
 // producing stage reads it as its mutation delta + propagates it to its outbound D2D
@@ -410,9 +412,7 @@ MeshWorkload make_relay_like_workload(
 // D2DStreamServiceReceiver (the terminal stage always has a fabric inbound).
 template <typename Upstream>
 MeshWorkload make_d2h_relay_workload(
-    Upstream* inbound,
-    const std::shared_ptr<MeshDevice>& mesh,
-    D2HStreamService* d2h_service) {
+    Upstream* inbound, const std::shared_ptr<MeshDevice>& mesh, D2HStreamService* d2h_service) {
     const auto& coords = inbound->get_backing_tensor().tensor_topology().mesh_coords();
     const auto* up_buf = inbound->get_backing_tensor().buffer();
     const uint32_t page_size = up_buf->aligned_page_size();
@@ -1267,6 +1267,36 @@ TEST_F(CrossProcessD2DFixture, ForwardChainStress) {
         ++case_idx;
         run_forward_chain_stress(mesh_device_, combo.global_shape, combo.worker_cores, combo.num_iters);
     }
+}
+
+// Rank 0 asks for relay mode and rank 1 does not. Only a relay side enters the relay
+// exchange, so without the relay field in the startup settings check the sender would wait
+// for an answer forever. Both sides must throw at that check instead.
+TEST_F(CrossProcessD2DFixture, MismatchedRelayThrows) {
+    const auto& ctx = DistributedContext::get_current_world();
+    const int world_size = *ctx->size();
+    const int rank = *ctx->rank();
+    if (world_size < 2) {
+        GTEST_SKIP() << "needs >= 2 ranks; got " << world_size;
+    }
+    // TT_METAL_FABRIC_INTERMESH_VC0=1 turns relay on for both sides, so they would match.
+    const char* on_vc0 = std::getenv("TT_METAL_FABRIC_INTERMESH_VC0");
+    if (on_vc0 != nullptr && std::string_view(on_vc0) == "1") {
+        GTEST_SKIP() << "TT_METAL_FABRIC_INTERMESH_VC0=1 forces relay on for both sides";
+    }
+
+    const ttnn::Shape global_shape({1, 1, 32, 64});
+    const D2DEndpointConfig endpoints{.sender_rank = Rank{0}, .receiver_rank = Rank{1}, .distributed_context = ctx};
+    if (rank == 0) {
+        auto cfg = make_cfg(mesh_device_, global_shape);
+        cfg.relay = true;
+        EXPECT_THROW(D2DStreamService::create_sender(mesh_device_, std::move(cfg), endpoints), std::exception);
+    } else if (rank == 1) {
+        EXPECT_THROW(
+            D2DStreamService::create_receiver(mesh_device_, make_cfg(mesh_device_, global_shape), endpoints),
+            std::exception);
+    }
+    ctx->barrier();
 }
 
 }  // namespace

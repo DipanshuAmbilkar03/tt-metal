@@ -166,10 +166,11 @@ struct ExchangedEndpoint {
 // backing tensor base addresses with the peer process so each side can build the
 // identical SocketConnection list and the sender can target the receiver's DRAM
 // tensor directly. The payload is [tensor_page_size, num_pages, socket_page_size,
-//     num_socket_pages, metadata_size_bytes, share_fabric_links,
-//     x0, y0, addr0, x1, y1, addr1, ...] in `coords` order. The six fingerprint
+//     num_socket_pages, metadata_size_bytes, share_fabric_links, relay,
+//     x0, y0, addr0, x1, y1, addr1, ...] in `coords` order. The seven fingerprint
 // fields catch any peer mismatch (global_spec, mapper, fifo_size, metadata,
-// share_fabric_links) before the fabric hangs silently. is_sender orders send/recv
+// share_fabric_links, relay) before the fabric hangs silently. relay must match because
+// only a relay side enters exchange_relay_peer; the other side would never answer it. is_sender orders send/recv
 // to avoid a symmetric-blocking deadlock.
 ExchangedEndpoint exchange_service_cores(
     const std::shared_ptr<distributed::multihost::DistributedContext>& ctx,
@@ -183,11 +184,13 @@ ExchangedEndpoint exchange_service_cores(
     uint32_t socket_page_size,
     uint32_t num_socket_pages,
     uint32_t metadata_size_bytes,
-    bool share_fabric_links) {
+    bool share_fabric_links,
+    bool relay) {
     std::vector<uint32_t> out;
 
-    // Push 6 * 3 * coords.size() arguments to out
-    const uint32_t kNumOutputArgs = 6 + 3 * coords.size();
+    // Push 7 + 3 * coords.size() arguments to out
+    constexpr uint32_t kNumFingerprintArgs = 7;
+    const uint32_t kNumOutputArgs = kNumFingerprintArgs + 3 * coords.size();
     out.reserve(kNumOutputArgs);
     out.push_back(tensor_page_size);
     out.push_back(num_pages);
@@ -195,6 +198,7 @@ ExchangedEndpoint exchange_service_cores(
     out.push_back(num_socket_pages);
     out.push_back(metadata_size_bytes);
     out.push_back(share_fabric_links ? 1u : 0u);
+    out.push_back(relay ? 1u : 0u);
     for (const auto& c : coords) {
         const auto core = local_cores.at(c);
         out.push_back(static_cast<uint32_t>(core.x));
@@ -223,36 +227,41 @@ ExchangedEndpoint exchange_service_cores(
     const uint32_t in_num_socket_pages = in[3];
     const uint32_t in_metadata_size_bytes = in[4];
     const bool in_share_fabric_links = static_cast<bool>(in[5]);
+    const bool in_relay = static_cast<bool>(in[6]);
 
     const bool fp_match = in_tensor_page_size == tensor_page_size && in_num_pages == num_pages &&
                           in_socket_page_size == socket_page_size && in_num_socket_pages == num_socket_pages &&
-                          in_metadata_size_bytes == metadata_size_bytes && in_share_fabric_links == share_fabric_links;
+                          in_metadata_size_bytes == metadata_size_bytes &&
+                          in_share_fabric_links == share_fabric_links && in_relay == relay;
     TT_FATAL(
         fp_match,
         "D2DStreamService: peer chunk-plan mismatch — "
         "local (page_size={} num_pages={} socket_page_size={} num_socket_pages={} "
-        "metadata_size_bytes={} share_fabric_links={}) vs "
+        "metadata_size_bytes={} share_fabric_links={} relay={}) vs "
         "peer (page_size={} num_pages={} socket_page_size={} num_socket_pages={} "
-        "metadata_size_bytes={} share_fabric_links={}); "
+        "metadata_size_bytes={} share_fabric_links={} relay={}); "
         "sender and receiver must use the same global_spec, mapper, fifo_size, "
-        "metadata_size_bytes, and share_fabric_links",
+        "metadata_size_bytes, share_fabric_links, and relay (TT_METAL_FABRIC_INTERMESH_VC0)",
         tensor_page_size,
         num_pages,
         socket_page_size,
         num_socket_pages,
         metadata_size_bytes,
         share_fabric_links,
+        relay,
         in_tensor_page_size,
         in_num_pages,
         in_socket_page_size,
         in_num_socket_pages,
         in_metadata_size_bytes,
-        in_share_fabric_links);
+        in_share_fabric_links,
+        in_relay);
 
     ExchangedEndpoint peer;
     for (size_t i = 0; i < coords.size(); ++i) {
-        peer.service_cores.emplace(coords[i], CoreCoord{in[6 + 3 * i], in[6 + 3 * i + 1]});
-        peer.backing_addrs.emplace(coords[i], static_cast<DeviceAddr>(in[6 + 3 * i + 2]));
+        const size_t b = kNumFingerprintArgs + 3 * i;
+        peer.service_cores.emplace(coords[i], CoreCoord{in[b], in[b + 1]});
+        peer.backing_addrs.emplace(coords[i], static_cast<DeviceAddr>(in[b + 2]));
     }
     return peer;
 }
@@ -2723,7 +2732,8 @@ std::unique_ptr<D2DStreamServiceSender> D2DStreamService::create_sender(
         common.plan.socket_page_size,
         common.plan.num_socket_pages,
         common.metadata_size_bytes,
-        cfg.share_fabric_links);
+        cfg.share_fabric_links,
+        cfg.relay);
     auto receiver_service_cores = std::move(peer.service_cores);
     auto receiver_tensor_addrs = std::move(peer.backing_addrs);
 
@@ -2805,7 +2815,8 @@ std::unique_ptr<D2DStreamServiceReceiver> D2DStreamService::create_receiver(
         common.plan.socket_page_size,
         common.plan.num_socket_pages,
         common.metadata_size_bytes,
-        cfg.share_fabric_links);
+        cfg.share_fabric_links,
+        cfg.relay);
     auto sender_service_cores = std::move(peer.service_cores);
 
     auto connections =
