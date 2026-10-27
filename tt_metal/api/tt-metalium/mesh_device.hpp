@@ -252,7 +252,9 @@ public:
     // TODO: #17477 - Remove the methods that assume 2D mesh.
     size_t num_rows() const;
     size_t num_cols() const;
-    [[deprecated("Deprecated, use get_device(const MeshCoordinate&) instead. This will be removed after 2026-11-19.")]]
+    [[deprecated(
+        "Deprecated, use tt::tt_metal::internal::get_device(const MeshDevice&, const MeshCoordinate&) instead. "
+        "This will be removed after 2026-11-19.")]]
     IDevice* get_device(size_t row_idx, size_t col_idx) const;
 
     // Returns true if the coordinate is local to this mesh device.
