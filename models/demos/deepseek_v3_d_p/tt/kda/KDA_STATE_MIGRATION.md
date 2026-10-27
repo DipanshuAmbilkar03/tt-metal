@@ -65,12 +65,13 @@ The convolution order is the golden's `[all q | all k | all v]`. The recurrent g
 
 `models/demos/deepseek_v3_d_p/tt/kda/state_adapter.py` owns the geometry, the maps, the per-layer
 export (`indexed_entry_copy` of the native recurrent tiles; reshape/permute to slab rows, then
-`indexed_entry_copy`, for convolution), the import (`slice` back to a native carry) and the host
-decoders (`recurrent_segment_to_torch`, `convolution_segment_to_torch`, `assemble_*`). The export takes
-the slot as a device tensor and resolves batch `slot * L + layer_position` on device, so a captured
-export follows the slot in the traced metadata. `KdaStateCache.commit` exports every committed layer
-inside the captured region, so the state a reader sees is the one after the last committed chunk, and
-it lands before any later MLA layer acks that chunk. `reset(slot)` zeroes the slot's regions too.
+`indexed_entry_copy`, for convolution), the import (the same copies back into a native carry) and the
+host decoders (`recurrent_segment_to_torch`, `convolution_segment_to_torch`, `assemble_*`). Both take
+the slot as a device tensor and resolve batch `slot * L + layer_position` on device, so a captured
+load or store follows the slot in the traced metadata. The slabs are the KDA carries' only store:
+every K3 KDA layer loads its slot's carry from them and stores the replacement back inside the
+captured region, so the state a reader sees is the one after the last committed chunk, and it lands
+before any later MLA layer acks that chunk. `zero_slot(slot)` zeroes the slot's regions.
 
 ## Reading it back
 

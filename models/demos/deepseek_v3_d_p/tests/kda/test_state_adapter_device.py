@@ -18,6 +18,7 @@ import torch
 import ttnn
 from models.common.utility_functions import run_for_blackhole
 from models.demos.deepseek_v3_d_p.reference.kimi_k3_config import kimi_k3_kda_config
+from models.demos.deepseek_v3_d_p.tests.kda.utils import read_slab_layer
 from models.demos.deepseek_v3_d_p.tt.kda.kda import KdaState
 from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     KdaContractGeometry,
@@ -26,6 +27,7 @@ from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     assemble_convolution,
     assemble_recurrent,
     convolution_segment_to_torch,
+    deallocate_state,
     recurrent_segment_to_torch,
     device_scalar,
 )
@@ -182,11 +184,13 @@ def test_slabs_round_trip_replay_and_table(mesh_device, device_params, layer_ids
                     name=f"conv slot{slot} L{layer} ({row},{col})",
                 )
 
-    # 2. Import lands the same bytes back in a native carry.
+    # 2. Import lands the same bytes back in a native carry, through the same device-read slot.
     for (slot, layer), state in natives.items():
         back = allocate_native_state(mesh_device, geometry)
-        slabs.import_layer(back, slot, layer)
+        index = device_scalar(mesh_device, slot)
+        slabs.import_layer(back, index, layer)
         ttnn.synchronize_device(mesh_device)
+        ttnn.deallocate(index)
         for index, (want, got) in enumerate(
             zip(ttnn.get_device_tensors(state.recurrent), ttnn.get_device_tensors(back.recurrent))
         ):
@@ -314,6 +318,23 @@ def test_slabs_round_trip_replay_and_table(mesh_device, device_params, layer_ids
             table.read_device_chunk(probe_layer, kda_position(geometry, kind, 5, KDA_VERSIONS - 1), probe_slot, cfg_id)
         ) == bytes(table.read_device_chunk(probe_layer, kda_position(geometry, kind, 5, 0), probe_slot, cfg_id))
     print(f"host {socket.gethostname()}: table check ok for fabric node {int(fid.mesh_id)}:{int(fid.chip_id)}")
+
+    # 7. Zeroing a slot zeroes every layer of that slot and nothing else.
+    def imported(slot, layer):
+        back = read_slab_layer(mesh_device, slabs, slot, layer)
+        ttnn.synchronize_device(mesh_device)
+        host = [ttnn.to_torch(t) for s in (back.recurrent, back.convolution) for t in ttnn.get_device_tensors(s)]
+        deallocate_state(back)
+        return host
+
+    others = {(slot, layer): imported(slot, layer) for slot in range(1, num_slots) for layer in layer_ids}
+    slabs.zero_slot(0)
+    for layer in layer_ids:
+        for index, got in enumerate(imported(0, layer)):
+            assert torch.count_nonzero(got) == 0, f"zero_slot(0) left nonzero bytes in L{layer} dev{index}"
+    for (slot, layer), want in others.items():
+        for index, (w, g) in enumerate(zip(want, imported(slot, layer))):
+            assert_bit_identical(w, g, name=f"zero_slot(0) touched slot{slot} L{layer} dev{index}")
 
     for state in natives.values():
         ttnn.deallocate(state.recurrent)

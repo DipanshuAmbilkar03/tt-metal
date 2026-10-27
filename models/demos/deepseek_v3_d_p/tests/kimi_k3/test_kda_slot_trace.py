@@ -19,16 +19,17 @@ from models.demos.deepseek_v3_d_p.tests.kda.utils import (
     build_layer,
     mla_row_permutation,
     random_weights,
+    read_slab_layer,
     reconstruct_sp_tp_tensor,
 )
 from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     KdaContractGeometry,
     KdaStates,
+    allocate_native_state,
     deallocate_state,
     device_scalar,
 )
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention, build_kda_scalars
-from models.demos.deepseek_v3_d_p.tt.kimi_k3.kda_state import KdaStateCache
 from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import assert_bit_identical, make_actual_start
 
 pytestmark = run_for_blackhole()
@@ -69,11 +70,10 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
     config = KDAConfig(hidden_size=256, num_heads=8, head_k_dim=128, head_v_dim=128, conv_kernel_size=4, norm_eps=1e-5)
     weights = random_weights(config)
     layer = build_layer(mesh_device, config, weights, sp_axis, tp_axis, active_seq_len=capacity, summary_group_chunks=2)
-    cache = KdaStateCache({LAYER: layer}, num_slots=NUM_SLOTS)
     geometry = KdaContractGeometry.from_kda_config(config, mesh_shape=mesh_shape, sp_axis=sp_axis, tp_axis=tp_axis)
     slabs = KdaStates.allocate(mesh_device, geometry, layer_ids=(LAYER,), num_slots=NUM_SLOTS)
-    cache.bind_slabs(slabs)
-    attention = TtK3KdaAttention(layer, LAYER, tp_axis, 1, ttnn.Topology.Linear, cache)
+    scratch = allocate_native_state(mesh_device, geometry)
+    attention = TtK3KdaAttention(layer, LAYER, tp_axis, 1, ttnn.Topology.Linear, scratch)
     dims = [None, None]
     dims[sp_axis], dims[tp_axis] = 2, 3
 
@@ -93,7 +93,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
     def carries():
         snapshots = []
         for slot in range(NUM_SLOTS):
-            state = cache.read(LAYER, slot)
+            state = read_slab_layer(mesh_device, slabs, slot, LAYER)
             snapshots.append(_host(state.recurrent) + _host(state.convolution))
             deallocate_state(state)
         return snapshots
@@ -121,7 +121,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
             ttnn.deallocate(source)
             before = carries()
             scalars, owned = build_kda_scalars(mesh_device, None, slot, start, start + length)
-            output = attention.forward(input_tt, K3AttnContext(kda_scalars=scalars))
+            output = attention.forward(input_tt, K3AttnContext(kda_scalars=scalars, kda_states=slabs))
             for scalar in owned:
                 ttnn.deallocate(scalar)
             observed = observe(output, start, length)
@@ -135,14 +135,14 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
             eager.append(observed)
 
         # One capture, recorded on slot 0. Warm until program and resource state settle first.
-        ctx = K3AttnContext(kda_scalars=(slot_tt, start_tt, end_tt))
+        ctx = K3AttnContext(kda_scalars=(slot_tt, start_tt, end_tt), kda_states=slabs)
         for _ in range(2):
             ttnn.deallocate(attention.forward(input_tt, ctx))
         trace = ttnn.begin_trace_capture(mesh_device, cq_id=0)
         traced_output = attention.forward(input_tt, ctx)
         ttnn.end_trace_capture(mesh_device, trace, cq_id=0)
         for slot in range(NUM_SLOTS):
-            cache.reset(slot)
+            slabs.zero_slot(slot)
 
         for index, (slot, start, length) in enumerate(CHUNKS):
             source = upload(chunk_input(index, start))
@@ -170,7 +170,7 @@ def test_one_capture_serves_every_slot(mesh_device, sp_axis, tp_axis, device_par
             ttnn.release_trace(mesh_device, trace)
         if traced_output is not None:
             ttnn.deallocate(traced_output)
-        cache.deallocate()
+        deallocate_state(scratch)
         slabs.deallocate()
         for tensor in (input_tt, slot_tt, start_tt, end_tt):
             ttnn.deallocate(tensor)
