@@ -517,6 +517,12 @@ void check_chunks(
         "num_cores ({}) must be at most the compute grid ({})",
         config.num_cores,
         grid_cores);
+    // Items are numbered in a 20-bit field of the work list; one tile-row of one head is the most items.
+    const uint64_t max_items = static_cast<uint64_t>(shape.batch) * shape.q_heads * shape.St;
+    TT_FATAL(
+        max_items <= sdpa_fw_items::unit_field_max(sdpa_fw_items::kUnitItemBits) + 1ULL,
+        "batch * heads * sequence tile-rows ({}) exceeds the work list's item range",
+        max_items);
     const SDPAForwardChunks user = user_chunks(config, shape);
     if (user.Sq_chunk_t != 0U && user.Sk_chunk_t != 0U && user.heads_per_item != 0U) {
         check_l1(shape, user, l1_budget_bytes, may_split(config, shape));
