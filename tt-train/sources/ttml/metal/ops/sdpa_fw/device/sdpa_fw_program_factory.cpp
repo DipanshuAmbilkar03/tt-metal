@@ -56,7 +56,6 @@ constexpr auto kPartialOutCbIndex = tt::CBIndex::c_18;
 constexpr auto kPartialAlphaCbIndex = tt::CBIndex::c_19;
 
 const std::string kSplitUnitsDefKey = "SPLIT_UNITS";
-constexpr uint32_t kNumSemaphores = 4U;  // mergers per core, see kMaxMergersPerCore
 
 constexpr uint32_t kNumScalerTiles = 1U;
 
@@ -364,7 +363,7 @@ SDPAForwardProgramFactory::cached_program_t SDPAForwardProgramFactory::create(
             device);
     }
     std::vector<uint32_t> semaphore_ids;
-    for (uint32_t i = 0; i < kNumSemaphores; ++i) {
+    for (uint32_t i = 0; i < kMaxMergersPerCore; ++i) {
         semaphore_ids.push_back(tt::tt_metal::CreateSemaphore(program, all_cores, 0));
     }
 
