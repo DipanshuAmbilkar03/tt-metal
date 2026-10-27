@@ -57,8 +57,13 @@ RingSDPAFwProgramFactory::cached_mesh_workload_t RingSDPAFwProgramFactory::creat
 
         // Create SDPA forward operation with the effective mask type
         // No explicit mask tensor needed - SDPA kernel generates causal mask internally
+        // No cuts: a split schedule would allocate its partials scratch through the mesh device, once per
+        // coordinate and replicated on every device.
         sdpa_fw::device::operation_attributes_t sdpa_attrs{
-            .return_intermediates = true, .mask_type = effective_mask_type, .dropout_probability = 0.0F};
+            .return_intermediates = true,
+            .mask_type = effective_mask_type,
+            .dropout_probability = 0.0F,
+            .program_config = {.max_pieces = 1U}};
 
         sdpa_fw::device::tensor_args_t sdpa_tensor_args{
             .query = query,
