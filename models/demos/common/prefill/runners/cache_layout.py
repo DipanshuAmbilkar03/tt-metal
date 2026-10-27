@@ -38,6 +38,13 @@ def row_major_mesh_id(fnids, rows, cols, where):
     return ttnn.MeshId(mesh_id)
 
 
+def _export(export, value, path):
+    """Writes ``value`` to ``path`` through a temporary file, so a reader never sees a partial file."""
+    tmp = f"{path}.tmp"
+    export(value, tmp)
+    os.replace(tmp, path)
+
+
 def _derived_table(model, hosts):
     table = disaggregation.to_chunk_map(model)
     for fid, host_name in hosts:
@@ -64,8 +71,8 @@ def publish_kv_chunk_table(*, path, walk, layout_model, hosts, enable_env, model
                 f"{enable_env}=1, but the {model_name} cache layout model is not derivable: {not_derivable}"
             )
         table = _derived_table(model, hosts)
-        disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
-        disaggregation.export_to_protobuf_file(table, path)
+        _export(disaggregation.export_cache_layout_model_to_protobuf_file, model, model_path)
+        _export(disaggregation.export_to_protobuf_file, table, path)
         logger.info(
             f"[migration] {model_name} KV chunk address table derived from its cache layout model ({model_path}) "
             f"and serialized to {path} (configs={table.num_configs()}, entries={table.total_entries()})"
@@ -80,7 +87,7 @@ def publish_kv_chunk_table(*, path, walk, layout_model, hosts, enable_env, model
     else:
         difference = disaggregation.first_table_difference(walked, _derived_table(model, hosts))
         if difference is None:
-            disaggregation.export_cache_layout_model_to_protobuf_file(model, model_path)
+            _export(disaggregation.export_cache_layout_model_to_protobuf_file, model, model_path)
             logger.info(
                 f"[migration] the {model_name} cache layout model derives the walked KV chunk table; wrote it to "
                 f"{model_path}"
@@ -90,5 +97,5 @@ def publish_kv_chunk_table(*, path, walk, layout_model, hosts, enable_env, model
                 f"[migration] the KV chunk table derived from the {model_name} cache layout model differs from the "
                 f"walked table at {difference}; publishing the walked table without the model"
             )
-    disaggregation.export_to_protobuf_file(walked, path)
+    _export(disaggregation.export_to_protobuf_file, walked, path)
     return path
